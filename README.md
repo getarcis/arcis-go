@@ -1,4 +1,4 @@
-# Arcis — Go SDK
+# Arcis - Go SDK
 
 Security middleware for Go web applications. The core is stdlib-only;
 Gin, Echo, chi, and Fiber adapters each import their respective router
