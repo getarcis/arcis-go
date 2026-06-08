@@ -32,6 +32,40 @@ func newRouter(mw ...func(http.Handler) http.Handler) *chirouter.Mux {
 	return r
 }
 
+// realBrowserUA is what every test request sets as User-Agent so the
+// v1.7 default bot-detection step (which denies Go-http-client as SCRAPER)
+// doesn't block tests that aren't exercising bot behavior. Pair with
+// realBrowserHeaders to suppress behavioral-signal flagging too.
+const realBrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+// realGet performs an http.Get with browser-shaped headers so default
+// bot detection doesn't deny the request as a Go-http-client SCRAPER.
+func realGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", realBrowserUA)
+	req.Header.Set("Accept", "text/html")
+	req.Header.Set("Accept-Language", "en-US")
+	req.Header.Set("Accept-Encoding", "gzip")
+	return http.DefaultClient.Do(req)
+}
+
+// realPost performs an http.Post with browser-shaped headers (see realGet).
+func realPost(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", realBrowserUA)
+	req.Header.Set("Accept", "text/html")
+	req.Header.Set("Accept-Language", "en-US")
+	req.Header.Set("Accept-Encoding", "gzip")
+	return http.DefaultClient.Do(req)
+}
+
 // ── Middleware bundle ─────────────────────────────────────────────────
 
 func TestMiddleware_AllowPathSetsSecurityHeaders(t *testing.T) {
@@ -45,7 +79,7 @@ func TestMiddleware_AllowPathSetsSecurityHeaders(t *testing.T) {
 	defer srv.Close()
 	t.Cleanup(Cleanup)
 
-	res, err := http.Get(srv.URL + "/ping")
+	res, err := realGet(srv.URL + "/ping")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -79,7 +113,7 @@ func TestMiddleware_RateLimitReturns429AfterCap(t *testing.T) {
 
 	// Two requests succeed, third blows the limiter.
 	for i := 0; i < 2; i++ {
-		res, err := http.Get(srv.URL + "/")
+		res, err := realGet(srv.URL + "/")
 		if err != nil {
 			t.Fatalf("req %d failed: %v", i, err)
 		}
@@ -88,7 +122,7 @@ func TestMiddleware_RateLimitReturns429AfterCap(t *testing.T) {
 			t.Fatalf("req %d status = %d, want 200", i, res.StatusCode)
 		}
 	}
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("third request failed: %v", err)
 	}
@@ -145,7 +179,7 @@ func TestMiddleware_StashesSanitizerOnContext(t *testing.T) {
 	defer srv.Close()
 	t.Cleanup(Cleanup)
 
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -169,7 +203,7 @@ func TestHeaders_SetsHeadersWithoutRateLimit(t *testing.T) {
 	// Hammer the endpoint past any rate limit — Headers helper must NOT
 	// engage the limiter, so all 5 stay 200.
 	for i := 0; i < 5; i++ {
-		res, err := http.Get(srv.URL + "/")
+		res, err := realGet(srv.URL + "/")
 		if err != nil {
 			t.Fatalf("req %d failed: %v", i, err)
 		}
@@ -196,7 +230,7 @@ func TestSanitizer_StashesSanitizerOnContext(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -241,7 +275,7 @@ func TestSanitizeString_StripsScript(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Get(srv.URL + "/?q=" + "%3Cscript%3Ehi%3C%2Fscript%3E")
+	res, err := realGet(srv.URL + "/?q=" + "%3Cscript%3Ehi%3C%2Fscript%3E")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -265,7 +299,7 @@ func TestValidate_400OnInvalidJSON(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Post(srv.URL+"/", "application/json", strings.NewReader("not json"))
+	res, err := realPost(srv.URL+"/", "application/json", strings.NewReader("not json"))
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -287,7 +321,7 @@ func TestValidate_400OnSchemaFail(t *testing.T) {
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 	// Empty object — required field missing.
-	res, err := http.Post(srv.URL+"/", "application/json", strings.NewReader(`{}`))
+	res, err := realPost(srv.URL+"/", "application/json", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -315,7 +349,7 @@ func TestValidate_200AndStashesValidatedBody(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Post(srv.URL+"/", "application/json", strings.NewReader(`{"name":"alice"}`))
+	res, err := realPost(srv.URL+"/", "application/json", strings.NewReader(`{"name":"alice"}`))
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -344,7 +378,7 @@ func TestGetValidatedBody_NilWithoutMiddleware(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -361,7 +395,7 @@ func TestCsrfProtection_PostWithoutTokenIs403(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Post(srv.URL+"/", "application/json", strings.NewReader(`{}`))
+	res, err := realPost(srv.URL+"/", "application/json", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -379,7 +413,7 @@ func TestCsrfProtection_GetIssuesCookie(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -401,7 +435,7 @@ func TestSecureCookies_AddsSecureAttribute(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -483,7 +517,7 @@ func TestErrorHandler_RecoversFromPanicError(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -504,7 +538,7 @@ func TestErrorHandler_RecoversFromPanicString(t *testing.T) {
 
 	srv := httptest.NewServer(r)
 	defer srv.Close()
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}

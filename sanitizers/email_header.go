@@ -37,3 +37,24 @@ func DetectEmailHeaderInjection(input string) bool {
 	}
 	return emailHeaderInjectionPattern.MatchString(input)
 }
+
+// headerInjectionStrictPattern matches a newline (CRLF or bare CR/LF)
+// followed by ANY header-name token and a colon (\r\nSet-Cookie:,
+// \r\nHost:). This is the response-splitting / header-smuggling signal.
+// Unlike a bare-newline check it does not flag multi-line bodies
+// (markdown, code), so it is safe at the request boundary. Mirrors the
+// Node detectHeaderInjectionStrict + Python email-header-bare-newline.
+var headerInjectionStrictPattern = regexp.MustCompile(
+	`(?:\r\n|\r|\n)\s*[a-zA-Z][a-zA-Z0-9-]{0,40}\s*:`,
+)
+
+// DetectHeaderInjectionStrict returns true on a CRLF-then-header-name-then-
+// colon shape (response splitting / header smuggling), never on a bare
+// newline. Wired into ScanThreats; the broad DetectHeaderInjection stays
+// for response-header sanitization.
+func DetectHeaderInjectionStrict(input string) bool {
+	if input == "" {
+		return false
+	}
+	return headerInjectionStrictPattern.MatchString(input)
+}

@@ -31,9 +31,11 @@ var (
 	xpathInjectionChars = regexp.MustCompile(`['"|,()]`)
 
 	// Common operator-injection patterns: unescaped boolean injection
-	// (`' or '1'='1`), function tampering (`,`), and union (`|`).
+	// (`' or '1'='1`), function tampering (`,`), union (`|`), and blind
+	// extraction functions (substring(name(...)), string-length(,
+	// count(/) used to leak the document. Benchmark xpath-blind-substring.
 	xpathInjectionPattern = regexp.MustCompile(
-		`(?i)('\s*(or|and)\s*'|"\s*(or|and)\s*"|\)\s*(or|and)\s*\(|\|\s*/)`,
+		`(?i)('\s*(or|and)\s*'|"\s*(or|and)\s*"|\)\s*(or|and)\s*\(|\|\s*/|\bsubstring\s*\(\s*name\s*\(|\bstring-length\s*\(|\bcount\s*\(\s*/)`,
 	)
 
 	// Sanitization strips the dangerous control characters. Lossy.

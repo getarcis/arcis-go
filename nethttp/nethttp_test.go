@@ -19,13 +19,46 @@ func helloHandler() http.Handler {
 	})
 }
 
+// realBrowserUA is what every test request sets as User-Agent so the
+// v1.7 default bot-detection step (which denies Go-http-client as SCRAPER)
+// doesn't block tests that aren't exercising bot behavior.
+const realBrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+// realGet performs an http.Get with browser-shaped headers so default
+// bot detection doesn't deny the request as a Go-http-client SCRAPER.
+func realGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", realBrowserUA)
+	req.Header.Set("Accept", "text/html")
+	req.Header.Set("Accept-Language", "en-US")
+	req.Header.Set("Accept-Encoding", "gzip")
+	return http.DefaultClient.Do(req)
+}
+
+// realPost performs an http.Post with browser-shaped headers (see realGet).
+func realPost(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", realBrowserUA)
+	req.Header.Set("Accept", "text/html")
+	req.Header.Set("Accept-Language", "en-US")
+	req.Header.Set("Accept-Encoding", "gzip")
+	return http.DefaultClient.Do(req)
+}
+
 func TestMiddleware_AllowsCleanRequest(t *testing.T) {
 	h := archttp.Middleware()(helloHandler())
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 	defer archttp.Cleanup()
 
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -84,10 +117,7 @@ func TestMiddlewareWithConfig_BlockMode_AllowsCleanBody(t *testing.T) {
 	defer archttp.Cleanup()
 
 	body := strings.NewReader(`{"name":"Gagan"}`)
-	req, _ := http.NewRequest("POST", srv.URL+"/", body)
-	req.Header.Set("Content-Type", "application/json")
-
-	res, err := http.DefaultClient.Do(req)
+	res, err := realPost(srv.URL+"/", "application/json", body)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
@@ -106,7 +136,7 @@ func TestRateLimit_StandaloneRejectsAfterCap(t *testing.T) {
 	defer archttp.Cleanup()
 
 	for i := 0; i < 2; i++ {
-		res, err := http.Get(srv.URL + "/")
+		res, err := realGet(srv.URL + "/")
 		if err != nil {
 			t.Fatalf("get %d: %v", i, err)
 		}
@@ -116,7 +146,7 @@ func TestRateLimit_StandaloneRejectsAfterCap(t *testing.T) {
 		}
 	}
 
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("third get: %v", err)
 	}
@@ -140,7 +170,7 @@ func TestRateLimit_SkipsHealthcheck(t *testing.T) {
 	defer archttp.Cleanup()
 
 	for i := 0; i < 5; i++ {
-		res, err := http.Get(srv.URL + "/healthz")
+		res, err := realGet(srv.URL + "/healthz")
 		if err != nil {
 			t.Fatalf("healthz %d: %v", i, err)
 		}
@@ -151,13 +181,13 @@ func TestRateLimit_SkipsHealthcheck(t *testing.T) {
 	}
 
 	// First non-exempt call should pass.
-	res, _ := http.Get(srv.URL + "/api")
+	res, _ := realGet(srv.URL + "/api")
 	_ = res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("first /api call: got %d want 200", res.StatusCode)
 	}
 	// Second non-exempt call hits the limit of 1.
-	res, _ = http.Get(srv.URL + "/api")
+	res, _ = realGet(srv.URL + "/api")
 	_ = res.Body.Close()
 	if res.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("second /api call: got %d want 429", res.StatusCode)
@@ -178,7 +208,7 @@ func TestMiddlewareWithConfig_HeadersOnlyMode(t *testing.T) {
 	defer srv.Close()
 	defer archttp.Cleanup()
 
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -213,7 +243,7 @@ func TestGetSanitizer_ReturnsInstance(t *testing.T) {
 	defer srv.Close()
 	defer archttp.Cleanup()
 
-	res, err := http.Get(srv.URL + "/")
+	res, err := realGet(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
