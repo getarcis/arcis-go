@@ -50,8 +50,11 @@ func TestSanitizeString_SQL(t *testing.T) {
 	}{
 		{"removes DROP TABLE", "'; DROP TABLE users; --", "DROP"},
 		{"removes OR 1=1 pattern", "1 OR 1=1", "OR 1"},
-		{"removes SELECT", "SELECT * FROM users", "SELECT"},
-		{"removes DELETE", "1; DELETE FROM users", "DELETE"},
+		// v1.6.5 multi-token contract: bare SELECT / DELETE are NOT flagged
+		// (they false-positive on "please select an option"). Use real
+		// multi-token attack shapes instead.
+		{"removes INTO OUTFILE", "1 UNION SELECT 'x' INTO OUTFILE '/var/www/sh.php'", "OUTFILE"},
+		{"removes xp_cmdshell", "'; EXEC xp_cmdshell 'dir'", "xp_cmdshell"},
 		{"removes SQL comments", "admin'--", "--"},
 		{"removes UNION", "1 /* comment */ UNION SELECT", "UNION"},
 		{"removes pg_sleep (PostgreSQL timing)", "1; SELECT pg_sleep(5)", "pg_sleep"},

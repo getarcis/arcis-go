@@ -108,6 +108,13 @@ func ValidateURL(rawURL string, opts *ValidateURLOptions) ValidateURLResult {
 		}
 	}
 
+	// Check single-integer hex IP encoding (e.g., 0x7f000001 = 127.0.0.1)
+	if !opts.AllowLocalhost || !opts.AllowPrivate {
+		if reason := checkHexIP(hostname, opts.AllowLocalhost, opts.AllowPrivate); reason != "" {
+			return ValidateURLResult{Safe: false, Reason: reason}
+		}
+	}
+
 	// Check octal/hex IP encoding (e.g., 0177.0.0.1 = 127.0.0.1, 0x7f.0.0.1 = 127.0.0.1)
 	if !opts.AllowLocalhost || !opts.AllowPrivate {
 		if reason := checkOctalHexIP(hostname, opts.AllowLocalhost, opts.AllowPrivate); reason != "" {
@@ -199,6 +206,34 @@ func checkDecimalIP(hostname string, allowLocalhost, allowPrivate bool) string {
 	if !allowPrivate {
 		if reason := checkPrivateIP(dotted); reason != "" {
 			return reason + " (decimal IP: " + dotted + ")"
+		}
+	}
+	return ""
+}
+
+// checkHexIP detects a single hex-integer IP (e.g., 0x7f000001 = 127.0.0.1).
+// Go's url.Parse does not normalize numeric hosts, so this form arrives as
+// the literal hostname and would otherwise fall through to "safe".
+func checkHexIP(hostname string, allowLocalhost, allowPrivate bool) string {
+	if len(hostname) < 3 || (hostname[:2] != "0x" && hostname[:2] != "0X") {
+		return ""
+	}
+	num, err := strconv.ParseUint(hostname[2:], 16, 64)
+	if err != nil || num > 0xFFFFFFFF {
+		return ""
+	}
+	a := byte(num >> 24)
+	b := byte(num >> 16)
+	c := byte(num >> 8)
+	d := byte(num)
+	dotted := strconv.Itoa(int(a)) + "." + strconv.Itoa(int(b)) + "." + strconv.Itoa(int(c)) + "." + strconv.Itoa(int(d))
+
+	if !allowLocalhost && a == 127 {
+		return "loopback address (hex IP: " + dotted + ")"
+	}
+	if !allowPrivate {
+		if reason := checkPrivateIP(dotted); reason != "" {
+			return reason + " (hex IP: " + dotted + ")"
 		}
 	}
 	return ""

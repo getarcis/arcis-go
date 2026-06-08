@@ -149,6 +149,11 @@ type PromptInjectionSeverity = sanitizers.PromptInjectionSeverity
 var (
 	DetectPromptInjection   = sanitizers.DetectPromptInjection
 	SanitizePromptInjection = sanitizers.SanitizePromptInjection
+	// ScanPromptInjection / ScanPromptInjectionJSON walk a request body
+	// for prompt-injection signatures (v1.7 W6). Adapters call the JSON
+	// variant when Config.PromptInjection is true.
+	ScanPromptInjection     = sanitizers.ScanPromptInjection
+	ScanPromptInjectionJSON = sanitizers.ScanPromptInjectionJSON
 )
 
 // Token-budget protection (LLM-cost guard) types
@@ -214,8 +219,9 @@ const (
 	BotCategorySocial       = middleware.BotCategorySocial
 	BotCategoryMonitoring   = middleware.BotCategoryMonitoring
 	BotCategoryAICrawler    = middleware.BotCategoryAICrawler
-	BotCategoryScraper      = middleware.BotCategoryScraper
-	BotCategoryAutomated    = middleware.BotCategoryAutomated
+	BotCategoryScraper         = middleware.BotCategoryScraper
+	BotCategorySecurityScanner = middleware.BotCategorySecurityScanner
+	BotCategoryAutomated       = middleware.BotCategoryAutomated
 	BotCategoryUnknown      = middleware.BotCategoryUnknown
 	BotCategoryHuman        = middleware.BotCategoryHuman
 )
@@ -330,6 +336,16 @@ var DetectHeaderInjection = sanitizers.DetectHeaderInjection
 // ValidateURL checks a URL for SSRF safety.
 var ValidateURL = utils.ValidateURL
 
+// SSRFScanResult is the outcome of scanning a body for unsafe URLs (W5).
+type SSRFScanResult = utils.SSRFScanResult
+
+// ScanForSSRF recursively scans a parsed body for SSRF-shaped URL values.
+var ScanForSSRF = utils.ScanForSSRF
+
+// ScanForSSRFJSON parses raw JSON and runs ScanForSSRF. Adapters call
+// this on the request body when Config.SSRF is true (v1.7 W5).
+var ScanForSSRFJSON = utils.ScanForSSRFJSON
+
 // IsURLSafe is a convenience wrapper that returns true/false.
 var IsURLSafe = utils.IsURLSafe
 
@@ -392,6 +408,25 @@ var DetectBot = middleware.DetectBot
 
 // BotProtection creates an http.Handler middleware for bot detection.
 var BotProtection = middleware.BotProtection
+
+// DetectSensitivePath checks a URL path against the v1.7 W2 scanner
+// probe path list. Returns the matched pattern source (or empty string).
+var DetectSensitivePath = middleware.DetectSensitivePath
+
+// DetectForwardedSpoof reports a loopback address in a forwarded /
+// client-IP header (v1.7 W7 spoof detection).
+var DetectForwardedSpoof = middleware.DetectForwardedSpoof
+
+// IsUntrustedHost reports a Host / X-Forwarded-Host value outside the
+// trusted-host allowlist (v1.7 W7 host-poisoning, opt-in).
+var IsUntrustedHost = middleware.IsUntrustedHost
+
+// ForwardedHeaderNames are the headers DetectForwardedSpoof inspects.
+var ForwardedHeaderNames = middleware.ForwardedHeaderNames
+
+// SensitivePathPatterns is the default scanner probe path list used
+// by adapter middlewares when Config.ScannerPaths=true (the default).
+var SensitivePathPatterns = middleware.SensitivePathPatterns
 
 // ─── Tier 2: Signup Protection ──────────────────────────────────────────────
 
@@ -601,6 +636,58 @@ var InspectGraphqlQuery = sanitizers.InspectGraphqlQuery
 // default settings. Boolean wrapper around InspectGraphqlQuery.
 var DetectGraphqlAbuse = sanitizers.DetectGraphqlAbuse
 
+// DefaultGraphqlWireupOptions returns the tightened thresholds the
+// adapter middlewares use when GraphQL inspection is wired on by
+// default (v1.7 W3). MaxAliases is 10 (vs the standalone default of 50)
+// because real queries rarely alias more than a handful of fields and
+// 12-alias bombs slip past the looser default.
+func DefaultGraphqlWireupOptions() GraphqlGuardOptions {
+	return GraphqlGuardOptions{
+		MaxDepth:            10,
+		MaxLength:           10000,
+		BlockIntrospection:  true,
+		MaxAliases:          10,
+		BlockFragmentCycles: true,
+	}
+}
+
+// MassAssignDetectResult is the outcome of scanning a body for
+// privilege-escalation field names (v1.7 W4).
+type MassAssignDetectResult = middleware.MassAssignDetectResult
+
+// SensitiveFieldNames is the default privilege-escalation field set
+// used by DetectMassAssignment.
+var SensitiveFieldNames = middleware.SensitiveFieldNames
+
+// DetectMassAssignment recursively scans a parsed body for
+// privilege-escalation field names (isAdmin, role, permissions, ...).
+var DetectMassAssignment = middleware.DetectMassAssignment
+
+// DetectMassAssignmentJSON parses raw JSON and runs DetectMassAssignment.
+// Adapters call this on the request body when Config.MassAssign is true.
+var DetectMassAssignmentJSON = middleware.DetectMassAssignmentJSON
+
+// InspectGraphqlRequestBody parses a JSON request body, extracts a
+// string `query` field, and runs the GraphQL inspector against it.
+// Returns a result with Blocked=false when the body is not JSON, has
+// no `query` field, or the query is empty (i.e. "not a GraphQL
+// request, nothing to do"). The adapters call this on every request
+// when Config.GraphQL is true. (v1.7 W3 wire-up.)
+func InspectGraphqlRequestBody(raw []byte, opts GraphqlGuardOptions) GraphqlGuardResult {
+	if len(raw) == 0 {
+		return GraphqlGuardResult{Blocked: false}
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return GraphqlGuardResult{Blocked: false}
+	}
+	q, ok := parsed["query"].(string)
+	if !ok || q == "" {
+		return GraphqlGuardResult{Blocked: false}
+	}
+	return InspectGraphqlQuery(q, opts)
+}
+
 // ─── v1.6.2: Stateful Per-IP Correlation Window ──────────────────────────────
 
 // CorrelationWindow tracks a rolling per-IP event window with three
@@ -624,6 +711,36 @@ var NewCorrelationWindow = middleware.NewCorrelationWindow
 // ScannerDistinctVectors: 3, ScannerMinRequests: 20,
 // CredentialStuffingDistinctValues: 10, RaceWindowMs: 200).
 var NewCorrelationWindowOptions = middleware.NewCorrelationWindowOptions
+
+// ─── Protect Factory Helpers (improvements.md §1.4 — Go variant) ─────────────
+
+// ProtectOptions configures the per-framework ProtectLogin / ProtectSignup
+// / ProtectApi factory helpers each adapter (gin / echo / chi / fiber /
+// nethttp) exposes. It wires an optional *CorrelationWindow into the
+// composite, auto-extracting the client IP + route from the request.
+type ProtectOptions = middleware.ProtectOptions
+
+// ProtectDecision is the resolved verdict for one request after recording
+// it in the correlation window. Adapters translate Block + the detection
+// booleans into a framework-native 429.
+type ProtectDecision = middleware.ProtectDecision
+
+// ResolveProtect records one request in the options' correlation window
+// (when configured) and returns the resulting block decision. Shared by
+// every adapter's ProtectLogin / ProtectSignup / ProtectApi helper.
+var ResolveProtect = middleware.ResolveProtect
+
+// ExtractUsername pulls the distinct value from a JSON request body for
+// credential-stuffing tracking. Operates on raw bytes so the caller owns
+// the body read + restore.
+var ExtractUsername = middleware.ExtractUsername
+
+// Vector tags recorded in the correlation window per endpoint shape.
+const (
+	ProtectVectorLogin  = middleware.ProtectVectorLogin
+	ProtectVectorSignup = middleware.ProtectVectorSignup
+	ProtectVectorApi    = middleware.ProtectVectorApi
+)
 
 // ─── HPP (HTTP Parameter Pollution) Middleware ───────────────────────────────
 

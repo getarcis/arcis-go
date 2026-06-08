@@ -17,8 +17,9 @@ const (
 	BotCategorySocial       BotCategory = "SOCIAL"
 	BotCategoryMonitoring   BotCategory = "MONITORING"
 	BotCategoryAICrawler    BotCategory = "AI_CRAWLER"
-	BotCategoryScraper      BotCategory = "SCRAPER"
-	BotCategoryAutomated    BotCategory = "AUTOMATED"
+	BotCategoryScraper         BotCategory = "SCRAPER"
+	BotCategorySecurityScanner BotCategory = "SECURITY_SCANNER"
+	BotCategoryAutomated       BotCategory = "AUTOMATED"
 	BotCategoryUnknown      BotCategory = "UNKNOWN"
 	BotCategoryHuman        BotCategory = "HUMAN"
 )

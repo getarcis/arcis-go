@@ -32,6 +32,25 @@ func multiDecode(value string, maxPasses int) string {
 	return value
 }
 
+// normalizeForScan applies the SAME NFKC + multi-decode normalization
+// that SanitizeString uses, so block-mode detection (ScanThreats) honors
+// the fullwidth + encoded-bypass protection instead of matching the raw
+// bytes. Without it, ScanThreats missed `＜script＞` and `%3Cscript%3E`
+// that sanitize-mode already caught. v1.7 parity fix 2026-06-08.
+func normalizeForScan(value string) string {
+	return multiDecode(norm.NFKC.String(value), 4)
+}
+
+// scanAuthFields are identity/auth field names that must hold a scalar.
+// An array value here is a NoSQL type-juggling operator-injection shape
+// (e.g. {"username":["admin"]}). v1.7 nosql-type-juggle.
+var scanAuthFields = map[string]bool{
+	"username": true, "user": true, "userid": true, "user_id": true,
+	"login": true, "email": true, "password": true, "pass": true,
+	"passwd": true, "pwd": true, "token": true, "apikey": true,
+	"api_key": true, "secret": true, "otp": true, "pin": true,
+}
+
 // XSS / SQL / path / command patterns moved to `loader.go` —
 // loaded from the embedded `data/patterns.json` (a sync'd copy of
 // `packages/core/patterns.json`) at startup. The package-scope
@@ -49,6 +68,9 @@ var sstiDetectPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)__(?:class|mro|subclasses|globals|builtins|import)__`),           // Python dunder
 	regexp.MustCompile(`(?i)\{\{\s*config[.\[]`),                                             // Jinja2 config leak
 	regexp.MustCompile(`(?i)\{\{\s*(?:self|request|lipsum|cycler|joiner|namespace|range)\b`), // Jinja2 objects
+	// Velocity #set/#foreach + OGNL/Velocity method calls ($rt.exec,
+	// .getRuntime). Benchmark ssti-velocity-runtime.
+	regexp.MustCompile(`(?i)#set\s*\(\s*\$|#foreach\s*\(\s*\$|\$\w+\.(?:exec|getClass|getRuntime|getMethod|invoke)\b`),
 }
 
 // SSTI removal patterns — narrowed to avoid false positives on legitimate ${name}.

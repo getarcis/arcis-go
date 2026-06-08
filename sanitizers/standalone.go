@@ -281,6 +281,14 @@ func scanThreatsDepth(data interface{}, depth, maxDepth int) *ThreatHit {
 			if nosqlDangerousKeys[lower] {
 				return &ThreatHit{Vector: "nosql", Rule: "nosql/match", MatchedPattern: k}
 			}
+			// NoSQL type-juggling: an auth/identity field whose value is an
+			// array instead of a scalar (e.g. {"username":["admin"]}).
+			// Benchmark nosql-mongo-type-juggle.
+			if scanAuthFields[lower] {
+				if _, isArr := val.([]interface{}); isArr {
+					return &ThreatHit{Vector: "nosql", Rule: "nosql/type-juggle", MatchedPattern: k}
+				}
+			}
 			if hit := scanThreatsDepth(val, depth+1, maxDepth); hit != nil {
 				return hit
 			}
@@ -294,42 +302,66 @@ func scanThreatsDepth(data interface{}, depth, maxDepth int) *ThreatHit {
 		}
 		return nil
 	case string:
-		sample := v
+		// Normalize (NFKC + multi-decode) so block-mode detection honors
+		// the fullwidth + encoded-bypass protection, matching SanitizeString
+		// and the Node/Python scan paths. v1.7 parity fix 2026-06-08.
+		n := normalizeForScan(v)
+		sample := n
 		if len(sample) > 80 {
 			sample = sample[:80]
 		}
-		if DetectXSS(v) {
+		// __proto__ as a STRING VALUE (e.g. ["__proto__","isAdmin"] array
+		// form). The key check above only sees map keys. Benchmark
+		// proto-pollution-array-index.
+		if strings.Contains(n, "__proto__") {
+			return &ThreatHit{Vector: "prototype", Rule: "prototype/match", MatchedPattern: sample}
+		}
+		if DetectXSS(n) {
 			return &ThreatHit{Vector: "xss", Rule: "xss/match", MatchedPattern: sample}
 		}
-		if DetectSSTI(v) {
+		if DetectSSTI(n) {
 			return &ThreatHit{Vector: "ssti", Rule: "ssti/match", MatchedPattern: sample}
 		}
-		if DetectXXE(v) {
+		if DetectXXE(n) {
 			return &ThreatHit{Vector: "xxe", Rule: "xxe/match", MatchedPattern: sample}
 		}
+		// Deserialization markers (pickle incl. base64, Ruby, .NET,
+		// FastJSON, PHP). Wired into block mode in v1.7.
+		if d := DetectDeserialization(n); d != DeserializeNone {
+			return &ThreatHit{Vector: "deserialization", Rule: "deserialization/" + string(d), MatchedPattern: sample}
+		}
 		// Email-header CRLF + SMTP keyword: very specific.
-		if DetectEmailHeaderInjection(v) {
+		if DetectEmailHeaderInjection(n) {
 			return &ThreatHit{Vector: "email-header", Rule: "email-header/match", MatchedPattern: sample}
 		}
 		// LDAP-strict: before command so LDAP doesn't misclass as
 		// command on the `*` chars (Raghav's Responza pilot 2026-05-20
 		// regression — closed by this ordering in Python; mirrored here).
-		if DetectLdapInjectionStrict(v) {
+		if DetectLdapInjectionStrict(n) {
 			return &ThreatHit{Vector: "ldap", Rule: "ldap/match", MatchedPattern: sample}
 		}
 		// SQL before XPath: `1' OR '1'='1` matches both, SQL wins as
 		// canonical attribution.
-		if DetectSQL(v) {
+		if DetectSQL(n) {
 			return &ThreatHit{Vector: "sql", Rule: "sql/match", MatchedPattern: sample}
 		}
-		if DetectXPathInjection(v) {
+		if DetectXPathInjection(n) {
 			return &ThreatHit{Vector: "xpath", Rule: "xpath/match", MatchedPattern: sample}
 		}
-		if DetectPathTraversal(v) {
+		// Path detection on BOTH raw (encoded forms %C0%AE / %2e%2e that
+		// multi-decode would strip) and normalized (fullwidth slash).
+		if DetectPathTraversal(v) || DetectPathTraversal(n) {
 			return &ThreatHit{Vector: "path", Rule: "path/match", MatchedPattern: sample}
 		}
-		if DetectCommandInjection(v) {
+		if DetectCommandInjection(n) {
 			return &ThreatHit{Vector: "command", Rule: "command/match", MatchedPattern: sample}
+		}
+		// Header injection (response splitting / smuggling): CRLF + header
+		// name + colon. Last in the chain so more-specific detectors win.
+		// Mirrors Node detectHeaderInjectionStrict. Benchmark
+		// header-crlf-set-cookie, header-smuggling-content-length.
+		if DetectHeaderInjectionStrict(n) {
+			return &ThreatHit{Vector: "header", Rule: "header/match", MatchedPattern: sample}
 		}
 		return nil
 	}

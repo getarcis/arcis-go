@@ -54,12 +54,14 @@ func TestSanitizeXSS_RemovesJavascriptProtocol(t *testing.T) {
 // ─── SanitizeSQL tests ──────────────────────────────────────────────────────
 
 func TestSanitizeSQL_BlocksSQLKeywords(t *testing.T) {
+	// v1.6.5 multi-token contract: bare SELECT / DELETE FROM are not
+	// flagged (FP on "please select an option"). Use real attack shapes.
 	tests := []string{
-		"SELECT * FROM users",
 		"DROP TABLE users",
-		"1; DELETE FROM users",
 		"1 OR 1=1",
 		"UNION SELECT password FROM users",
+		"1 UNION SELECT 'x' INTO OUTFILE '/tmp/x'",
+		"'; EXEC xp_cmdshell 'dir'",
 	}
 	for _, input := range tests {
 		result := SanitizeSQL(input)
@@ -189,8 +191,8 @@ func TestDetectXSS_EmptyString(t *testing.T) {
 // ─── DetectSQL tests ────────────────────────────────────────────────────────
 
 func TestDetectSQL_DetectsKeywords(t *testing.T) {
+	// v1.6.5 multi-token contract: bare SELECT is not an attack signal.
 	attacks := []string{
-		"SELECT * FROM users",
 		"DROP TABLE users",
 		"UNION SELECT 1",
 		"1 OR 1=1",

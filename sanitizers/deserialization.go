@@ -1,9 +1,17 @@
 package sanitizers
 
 import (
+	"encoding/base64"
 	"regexp"
 	"strings"
 )
+
+// pickleB64Prefix cheaply pre-filters base64-encoded pickle: the base64
+// of \x80\x02..05 always starts "gA" + one of a known set of chars.
+var pickleB64Prefix = regexp.MustCompile(`^gA[I-Z]`)
+
+// b64Shape matches a plausible standalone base64 blob (>=12 chars).
+var b64Shape = regexp.MustCompile(`^[A-Za-z0-9+/]{12,}={0,2}$`)
 
 // V33 (v1.6) — Modern deserialization marker detection.
 //
@@ -94,6 +102,15 @@ func DetectDeserialization(payload string) DeserializeRuntime {
 	for _, head := range pythonPickleHeads {
 		if strings.HasPrefix(payload, head) {
 			return DeserializePythonPickle
+		}
+	}
+	// Base64-encoded pickle: prefix pre-filter, then decode + re-check the
+	// pickle head byte (\x80 + proto 2-5). Benchmark deser-python-pickle-marker.
+	if pickleB64Prefix.MatchString(payload) && b64Shape.MatchString(payload) {
+		if decoded, err := base64.StdEncoding.DecodeString(payload); err == nil {
+			if len(decoded) >= 2 && decoded[0] == 0x80 && decoded[1] >= 0x02 && decoded[1] <= 0x05 {
+				return DeserializePythonPickle
+			}
 		}
 	}
 	if strings.HasPrefix(payload, rubyMarshalHead) {

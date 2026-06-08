@@ -171,8 +171,10 @@ var sqlCases = []mutCase{
 	{"' OR 1=1--", []string{"or 1=1"}},
 	{"'; DROP TABLE users--", []string{"drop"}},
 	{"UNION SELECT * FROM users", []string{"union", "select"}},
-	{"admin'--", []string{"--"}},
-	{"1; DELETE FROM users", []string{"delete"}},
+	{"admin'-- ", []string{"--"}},
+	// v1.6.5 multi-token contract: bare DELETE FROM is not flagged; use a
+	// real multi-token attack instead.
+	{"1; ATTACH DATABASE '/tmp/x' AS y", []string{"attach"}},
 	{"SLEEP(5)", []string{"sleep("}},
 	// Oracle DBMS_* packages (improvements.md §1.1.e Q3).
 	{"foo; DBMS_LOCK.SLEEP(5)", []string{"dbms_"}},

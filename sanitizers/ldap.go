@@ -17,8 +17,9 @@ var (
 	// Detection: unescaped LDAP filter special chars
 	ldapDetectPattern = regexp.MustCompile(`[*()\\\x00]`)
 
-	// Detection: OR/AND bypass and wildcard abuse
-	ldapInjectionPattern = regexp.MustCompile(`\)\s*\(|\*\s*\)\s*\(`)
+	// Detection: OR/AND bypass, wildcard abuse, and null-byte truncation
+	// (admin\00 / real NUL). Benchmark ldap-null-byte-truncate.
+	ldapInjectionPattern = regexp.MustCompile(`\)\s*\(|\*\s*\)\s*\(|\x00|\\00`)
 
 	// Filter chars per RFC 4515
 	ldapFilterChars = regexp.MustCompile(`[*()\\\x00]`)

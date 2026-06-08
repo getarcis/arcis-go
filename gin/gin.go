@@ -195,6 +195,56 @@ type Config struct {
 	RateLimitSkip   func(*gin.Context) bool
 	RateLimitStore  arcis.RateLimitStore // Optional external store (e.g. Redis)
 
+	// Bot UA classification (v1.7 W1 wire-up). When Bot is true (the
+	// default), the middleware classifies the User-Agent against the
+	// 695-entry corpus and denies categories in BotDeny with 403.
+	// BotDeny defaults to {AUTOMATED, SCRAPER} to catch curl /
+	// python-requests / sqlmap / nikto / nuclei out of the box.
+	Bot     bool
+	BotDeny []arcis.BotCategory
+
+	// Scanner-path probe blocking (v1.7 W2 wire-up). When ScannerPaths
+	// is true (the default), requests against well-known probe paths
+	// (/.env, /.git, /wp-admin, /phpmyadmin, etc) are denied with 403.
+	// Set to false on apps with legitimate overlapping routes.
+	ScannerPaths bool
+
+	// GraphQL inspection (v1.7 W3 wire-up). When GraphQL is true (the
+	// default), JSON request bodies with a `query` field are inspected
+	// for depth-bomb, alias-bomb, fragment cycle, and introspection
+	// abuse. GraphQLOptions overrides the tightened wire-up defaults
+	// (MaxAliases: 10). Set GraphQL=false to disable.
+	GraphQL        bool
+	GraphQLOptions arcis.GraphqlGuardOptions
+
+	// MassAssign field detection (v1.7 W4 wire-up). When MassAssign is
+	// true (the default), JSON bodies are scanned recursively for
+	// privilege-escalation field names (isAdmin, role, permissions, ...)
+	// and denied with 403 when one is present. Set MassAssign=false on
+	// admin APIs that legitimately accept those fields.
+	MassAssign bool
+
+	// SSRF body-URL validation (v1.7 W5 wire-up). When SSRF is true (the
+	// default), JSON bodies are walked for URL-shaped strings and each is
+	// validated; private/loopback/metadata/file/gopher URLs are denied,
+	// public URLs pass. Set SSRF=false to disable.
+	SSRF bool
+
+	// PromptInjection detection on body strings (v1.7 W6 wire-up). When
+	// true (the default), JSON body string values are scanned for
+	// prompt-injection / jailbreak / tool-call-forgery signatures and
+	// denied at or above MinPromptSeverity (default "medium"). Set
+	// PromptInjection=false to disable.
+	PromptInjection    bool
+	MinPromptSeverity  string
+
+	// ForwardedHeaders inspection (v1.7 W7). When true, a loopback address
+	// in a forwarded/client-IP header is denied (spoofing). TrustedHosts,
+	// if set, also rejects Host / X-Forwarded-Host not in the allowlist.
+	ForwardedHeaders bool
+	TrustedHosts     []string
+
+
 	// Security headers options
 	Headers           bool
 	CSP               string
@@ -240,6 +290,16 @@ func DefaultConfig() Config {
 		RateLimit:         true,
 		RateLimitMax:      100,
 		RateLimitWindow:   time.Minute,
+		Bot:               true,
+		BotDeny:           []arcis.BotCategory{arcis.BotCategoryAutomated, arcis.BotCategorySecurityScanner},
+		ScannerPaths:      true,
+		GraphQL:           true,
+		GraphQLOptions:    arcis.DefaultGraphqlWireupOptions(),
+		MassAssign:        true,
+		SSRF:              true,
+		PromptInjection:   true,
+		MinPromptSeverity: "medium",
+		ForwardedHeaders:  true,
 		Headers:           true,
 		CSP:               "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; object-src 'none'; frame-ancestors 'none';",
 		FrameOptions:      "DENY",
@@ -452,6 +512,84 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 			}()
 		}
 
+		// Forwarded-header inspection (v1.7 W7). Loopback in a forwarded /
+		// client-IP header is a spoof; optional trusted-host allowlist.
+		if config.ForwardedHeaders {
+			if arcis.DetectForwardedSpoof(c.GetHeader) {
+				decision = telemetry.DecisionDeny
+				evtVector = "header"
+				evtRule = "header/forwarded-loopback-spoof"
+				evtSeverity = telemetry.SeverityHigh
+				evtReason = "Loopback address in forwarded header"
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+					"vector": "header", "rule": "header/forwarded-loopback-spoof",
+				})
+				return
+			}
+			if arcis.IsUntrustedHost(c.GetHeader, c.Request.Host, config.TrustedHosts) {
+				decision = telemetry.DecisionDeny
+				evtVector = "header"
+				evtRule = "header/untrusted-host"
+				evtSeverity = telemetry.SeverityHigh
+				evtReason = "Untrusted Host header"
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+					"vector": "header", "rule": "header/untrusted-host",
+				})
+				return
+			}
+		}
+
+		// Scanner-path probe blocking (v1.7 W2). Runs BEFORE bot detection.
+		if config.ScannerPaths {
+			if matched := arcis.DetectSensitivePath(c.Request.URL.Path, nil); matched != "" {
+				decision = telemetry.DecisionDeny
+				evtVector = "scanner-path"
+				evtRule = "scanner-path/probe"
+				evtMatched = matched
+				evtSeverity = telemetry.SeverityHigh
+				evtReason = "Scanner probe path"
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error":  "Access denied.",
+					"code":   "SECURITY_THREAT",
+					"vector": "scanner-path",
+				})
+				return
+			}
+		}
+
+		// Bot UA classification (v1.7 W1). Runs BEFORE rate-limit so bots
+		// don't consume legitimate-traffic quota. Skipped if Bot=false or
+		// BotDeny is empty.
+		if config.Bot && len(config.BotDeny) > 0 {
+			result := arcis.DetectBot(c.Request)
+			if result.IsBot {
+				denied := false
+				for _, denyCat := range config.BotDeny {
+					if result.Category == denyCat {
+						denied = true
+						break
+					}
+				}
+				if denied {
+					decision = telemetry.DecisionDeny
+					evtVector = "bot"
+					evtRule = "bot/" + strings.ToLower(string(result.Category))
+					evtSeverity = telemetry.SeverityMedium
+					evtReason = "Bot detected"
+					if result.Name != "" {
+						evtReason = "Bot detected: " + result.Name
+					}
+
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+						"error": "Access denied.",
+					})
+					return
+				}
+			}
+		}
+
 		// Skip function check for rate limiting
 		skipRateLimit := config.RateLimitSkip != nil && config.RateLimitSkip(c)
 
@@ -475,6 +613,86 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 					"retryAfter": int(result.Reset.Seconds()),
 				})
 				return
+			}
+		}
+
+		// Body-driven checks (v1.7 W3 + W4 + W5 + W6). Read + restore the
+		// JSON body once, then run GraphQL inspection, mass-assignment
+		// detection, SSRF URL validation, and prompt-injection detection
+		// off the same bytes. All run regardless of Block mode; skipped
+		// in dry-run.
+		if (config.GraphQL || config.MassAssign || config.SSRF || config.PromptInjection) && !config.DryRun {
+			ct := c.Request.Header.Get("Content-Type")
+			if c.Request.Body != nil && strings.HasPrefix(ct, "application/json") {
+				raw, err := io.ReadAll(c.Request.Body)
+				if err == nil {
+					c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+					c.Request.ContentLength = int64(len(raw))
+					if config.GraphQL {
+						if gqlRes := arcis.InspectGraphqlRequestBody(raw, config.GraphQLOptions); gqlRes.Blocked {
+							decision = telemetry.DecisionDeny
+							evtVector = "graphql"
+							evtRule = "graphql/" + gqlRes.Reason
+							evtSeverity = telemetry.SeverityHigh
+							evtReason = "GraphQL " + gqlRes.Reason + " limit exceeded"
+							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+								"error":  "Request blocked for security reasons",
+								"code":   "SECURITY_THREAT",
+								"vector": "graphql",
+								"rule":   "graphql/" + gqlRes.Reason,
+							})
+							return
+						}
+					}
+					if config.MassAssign {
+						if maRes := arcis.DetectMassAssignmentJSON(raw, nil); maRes.Detected {
+							decision = telemetry.DecisionDeny
+							evtVector = "mass-assignment"
+							evtRule = "mass-assignment/sensitive-field"
+							evtSeverity = telemetry.SeverityHigh
+							evtReason = "Mass-assignment field: " + maRes.Field
+							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+								"error":  "Request blocked for security reasons",
+								"code":   "SECURITY_THREAT",
+								"vector": "mass-assignment",
+								"rule":   "mass-assignment/sensitive-field",
+							})
+							return
+						}
+					}
+					if config.SSRF {
+						if ssrfRes := arcis.ScanForSSRFJSON(raw, nil); ssrfRes.Detected {
+							decision = telemetry.DecisionDeny
+							evtVector = "ssrf"
+							evtRule = "ssrf/blocked-url"
+							evtSeverity = telemetry.SeverityHigh
+							evtReason = "SSRF: " + ssrfRes.Reason
+							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+								"error":  "Request blocked for security reasons",
+								"code":   "SECURITY_THREAT",
+								"vector": "ssrf",
+								"rule":   "ssrf/blocked-url",
+							})
+							return
+						}
+					}
+					if config.PromptInjection {
+						if arcis.ScanPromptInjectionJSON(raw, config.MinPromptSeverity) {
+							decision = telemetry.DecisionDeny
+							evtVector = "prompt-injection"
+							evtRule = "prompt-injection/detected"
+							evtSeverity = telemetry.SeverityHigh
+							evtReason = "Prompt injection detected"
+							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+								"error":  "Request blocked for security reasons",
+								"code":   "SECURITY_THREAT",
+								"vector": "prompt-injection",
+								"rule":   "prompt-injection/detected",
+							})
+							return
+						}
+					}
+				}
 			}
 		}
 
