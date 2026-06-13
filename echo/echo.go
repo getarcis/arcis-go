@@ -859,6 +859,50 @@ func RateLimitWithSkip(max int, window time.Duration, skip func(echo.Context) bo
 	}
 }
 
+// BruteForce returns standalone brute-force protection middleware for login /
+// password-reset routes. Build the limiter once, keep the reference for
+// b.Reset(key) after a successful auth, and b.Close() on shutdown.
+func BruteForce(b *arcis.BruteForce) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			res := b.Check(c.Request())
+			if !res.Allowed {
+				retryAfter := int(res.RetryAfter.Seconds())
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				return c.JSON(b.StatusCode(), map[string]interface{}{
+					"error":      b.Message(),
+					"retryAfter": retryAfter,
+				})
+			}
+			return next(c)
+		}
+	}
+}
+
+// Overload returns standalone runtime-overload protection middleware that sheds
+// requests with 503 when the server is saturated. Build it once, Close() on
+// shutdown.
+func Overload(o *arcis.Overload) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if o.ExposeLagHeaderEnabled() {
+				c.Response().Header().Set("X-EventLoop-Lag", strconv.Itoa(int(o.CurrentLagMs()+0.5)))
+			}
+			if o.Overloaded() {
+				c.Response().Header().Set("Retry-After", strconv.Itoa(o.RetryAfterSeconds()))
+				return c.JSON(o.StatusCode(), map[string]interface{}{
+					"error":      o.Message(),
+					"retryAfter": o.RetryAfterSeconds(),
+				})
+			}
+			return next(c)
+		}
+	}
+}
+
 // Sanitizer returns a middleware that provides sanitization utilities.
 func Sanitizer() echo.MiddlewareFunc {
 	return SanitizerWithConfig(DefaultConfig())

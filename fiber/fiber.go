@@ -668,6 +668,48 @@ const sanitizerLocalKey = "arcis_sanitizer"
 
 // GetSanitizer retrieves the per-request Sanitizer that
 // MiddlewareWithConfig stashes on the request context. Returns a
+// BruteForce returns standalone brute-force protection middleware for login /
+// password-reset routes. Build the limiter once, keep the reference for
+// b.Reset(key) after a successful auth, and b.Close() on shutdown. Fiber is
+// fasthttp-based (no net/http request), so the key is c.IP(); cfg.KeyFunc /
+// cfg.Skip (which take *http.Request) are not consulted here.
+func BruteForce(b *arcis.BruteForce) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		res := b.CheckKey(c.IP())
+		if !res.Allowed {
+			retryAfter := int(res.RetryAfter.Seconds())
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			c.Set("Retry-After", strconv.Itoa(retryAfter))
+			return c.Status(b.StatusCode()).JSON(fiber.Map{
+				"error":      b.Message(),
+				"retryAfter": retryAfter,
+			})
+		}
+		return c.Next()
+	}
+}
+
+// Overload returns standalone runtime-overload protection middleware that sheds
+// requests with 503 when the server is saturated. Build it once, Close() on
+// shutdown.
+func Overload(o *arcis.Overload) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if o.ExposeLagHeaderEnabled() {
+			c.Set("X-EventLoop-Lag", strconv.Itoa(int(o.CurrentLagMs()+0.5)))
+		}
+		if o.Overloaded() {
+			c.Set("Retry-After", strconv.Itoa(o.RetryAfterSeconds()))
+			return c.Status(o.StatusCode()).JSON(fiber.Map{
+				"error":      o.Message(),
+				"retryAfter": o.RetryAfterSeconds(),
+			})
+		}
+		return c.Next()
+	}
+}
+
 // default sanitizer when the middleware was not in the chain (matches
 // the gin / echo / chi GetSanitizer behavior — handlers stay
 // panic-safe). The default config enables every vector.

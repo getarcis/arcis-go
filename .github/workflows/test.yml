@@ -1,0 +1,58 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (with race detector)
+        run: go test ./... -race -timeout 5m
+
+  spec-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Guards against arcis-go's spec/TEST_VECTORS.json drifting from the
+    # monorepo's authoritative copy. If the upstream repo updates the
+    # shared vectors and arcis-go isn't refreshed, TestDetectParity
+    # silently passes against stale data. This CI step compares the
+    # two by SHA-256 and fails when they diverge.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch upstream spec/TEST_VECTORS.json
+        run: |
+          curl -fsSL \
+            "https://raw.githubusercontent.com/getarcis/arcis/main/spec/TEST_VECTORS.json" \
+            -o /tmp/upstream-TEST_VECTORS.json
+
+      - name: Compare hashes
+        run: |
+          local_sha=$(sha256sum spec/TEST_VECTORS.json | awk '{print $1}')
+          upstream_sha=$(sha256sum /tmp/upstream-TEST_VECTORS.json | awk '{print $1}')
+          echo "local:    $local_sha"
+          echo "upstream: $upstream_sha"
+          if [ "$local_sha" != "$upstream_sha" ]; then
+            echo "::error::spec/TEST_VECTORS.json has drifted from getarcis/arcis main."
+            echo "Run: cp ../arcis/spec/TEST_VECTORS.json spec/TEST_VECTORS.json"
+            exit 1
+          fi

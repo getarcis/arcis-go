@@ -20,6 +20,18 @@ var urlShaped = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.\-]*://`)
 // schemes are blocked. Mirrors the Node + Python body-scan policy.
 var ssrfBodyScanProtocols = []string{"http", "https", "ftp", "ftps"}
 
+// ssrfRelevantSchemes are the schemes the body scan evaluates: the fetchable
+// ones plus the classic SSRF-amplifying ones (file, gopher, dict, ...). A
+// URL-shaped string with any other scheme is a typo or a custom app scheme
+// (lhttps://, myapp://) that no server-side fetch would act on, so it is
+// skipped rather than flagged. Dangerous schemes stay here so they keep being
+// blocked by ValidateURL's allowlist.
+var ssrfRelevantSchemes = map[string]bool{
+	"http": true, "https": true, "ftp": true, "ftps": true, "file": true,
+	"gopher": true, "dict": true, "ldap": true, "ldaps": true, "tftp": true,
+	"sftp": true, "ssh": true, "smb": true, "jar": true, "netdoc": true,
+}
+
 // isLocalhostHostname reports whether the URL's host is the literal
 // localhost hostname (or *.localhost). Allowed by the body scan because
 // it is ubiquitous in dev/config payloads; loopback IP forms are not.
@@ -74,6 +86,11 @@ func walkSSRF(value interface{}, opts *ValidateURLOptions, depth, maxDepth int) 
 	case string:
 		trimmed := strings.TrimSpace(v)
 		if urlShaped.MatchString(trimmed) {
+			// Skip schemes a server-side fetch would never act on (typos like
+			// lhttps://, custom app schemes). Not an SSRF vector.
+			if i := strings.Index(trimmed, ":"); i > 0 && !ssrfRelevantSchemes[strings.ToLower(trimmed[:i])] {
+				return nil
+			}
 			// localhost hostname allowed (dev config); loopback IPs not.
 			if isLocalhostHostname(trimmed) {
 				return nil

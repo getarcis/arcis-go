@@ -41,6 +41,8 @@ type parityBlock struct {
 	SSTINegative    []parityCase `json:"ssti_negative"`
 	XXEPositive     []parityCase `json:"xxe_positive"`
 	XXENegative     []parityCase `json:"xxe_negative"`
+	NoSQLPositive   []parityCase `json:"nosql_positive"`
+	NoSQLNegative   []parityCase `json:"nosql_negative"`
 }
 
 type specRoot struct {
@@ -124,5 +126,9 @@ func TestDetectParity(t *testing.T) {
 	})
 	t.Run("xxe", func(t *testing.T) {
 		runDetectorParity(t, "DetectXXE", DetectXXE, parity.XXEPositive, parity.XXENegative)
+	})
+	t.Run("nosql", func(t *testing.T) {
+		runDetectorParity(t, "DetectNoSQLString", DetectNoSQLString,
+			parity.NoSQLPositive, parity.NoSQLNegative)
 	})
 }
