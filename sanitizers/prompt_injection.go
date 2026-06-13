@@ -134,6 +134,22 @@ var promptInjectionSignatures = []promptInjectionSignature{
 		description: "Roleplay-based jailbreak prefix",
 	},
 	{
+		// The "grandma exploit": emotional/nostalgic framing used to coax the
+		// model into reciting secret material. Requires BOTH the family-elder
+		// reciting framing AND a key/credential/password token, so wholesome
+		// "grandma read me bedtime stories" / "grandma's cookie recipe" never
+		// match -- only the credential-soliciting variant does.
+		rule: "emotional-jailbreak-secrets",
+		pattern: regexp.MustCompile(
+			`(?i)\bgrand(?:m(?:a|other)|pa|father)\b[^.?!]{0,60}` +
+				`\b(?:read|tell|recite|sing|sang|whisper|list|share)\b[^.?!]{0,80}` +
+				`\b(?:(?:activation|product|license|serial|registration|api|ssh|secret|private|encryption)[\s-]*keys?` +
+				`|passwords?|credentials?|serial\s*numbers?)\b`,
+		),
+		severity:    PromptInjectionHigh,
+		description: "Emotional-framing jailbreak soliciting keys/credentials (grandma exploit)",
+	},
+	{
 		rule: "no-restrictions",
 		pattern: regexp.MustCompile(
 			`(?i)\b(?:without\s+(?:any\s+)?(?:restrictions?|limits?|filters?|safety|guidelines?|moral|ethic\w*)` +
