@@ -47,6 +47,8 @@ type parityBlock struct {
 	PromptInjNeg    []parityCase `json:"prompt_injection_negative"`
 	DeserPos        []parityCase `json:"deserialization_positive"`
 	DeserNeg        []parityCase `json:"deserialization_negative"`
+	GraphqlPos      []parityCase `json:"graphql_positive"`
+	GraphqlNeg      []parityCase `json:"graphql_negative"`
 }
 
 type specRoot struct {
@@ -144,5 +146,9 @@ func TestDetectParity(t *testing.T) {
 		runDetectorParity(t, "DetectDeserialization",
 			func(s string) bool { return DetectDeserialization(s) != DeserializeNone },
 			parity.DeserPos, parity.DeserNeg)
+	})
+	t.Run("graphql", func(t *testing.T) {
+		runDetectorParity(t, "DetectGraphqlAbuse", DetectGraphqlAbuse,
+			parity.GraphqlPos, parity.GraphqlNeg)
 	})
 }
