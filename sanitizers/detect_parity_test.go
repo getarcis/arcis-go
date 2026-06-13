@@ -43,6 +43,10 @@ type parityBlock struct {
 	XXENegative     []parityCase `json:"xxe_negative"`
 	NoSQLPositive   []parityCase `json:"nosql_positive"`
 	NoSQLNegative   []parityCase `json:"nosql_negative"`
+	PromptInjPos    []parityCase `json:"prompt_injection_positive"`
+	PromptInjNeg    []parityCase `json:"prompt_injection_negative"`
+	DeserPos        []parityCase `json:"deserialization_positive"`
+	DeserNeg        []parityCase `json:"deserialization_negative"`
 }
 
 type specRoot struct {
@@ -130,5 +134,15 @@ func TestDetectParity(t *testing.T) {
 	t.Run("nosql", func(t *testing.T) {
 		runDetectorParity(t, "DetectNoSQLString", DetectNoSQLString,
 			parity.NoSQLPositive, parity.NoSQLNegative)
+	})
+	t.Run("prompt_injection", func(t *testing.T) {
+		runDetectorParity(t, "DetectPromptInjection",
+			func(s string) bool { return DetectPromptInjection(s).Detected },
+			parity.PromptInjPos, parity.PromptInjNeg)
+	})
+	t.Run("deserialization", func(t *testing.T) {
+		runDetectorParity(t, "DetectDeserialization",
+			func(s string) bool { return DetectDeserialization(s) != DeserializeNone },
+			parity.DeserPos, parity.DeserNeg)
 	})
 }
