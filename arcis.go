@@ -115,6 +115,11 @@ type TokenBucketLimiter = middleware.TokenBucketLimiter
 type BotCategory = middleware.BotCategory
 type BotDetectionResult = middleware.BotDetectionResult
 type BotProtectionOptions = middleware.BotProtectionOptions
+type BruteForce = middleware.BruteForce
+type BruteForceConfig = middleware.BruteForceConfig
+type BruteForceResult = middleware.BruteForceResult
+type Overload = middleware.Overload
+type OverloadConfig = middleware.OverloadConfig
 
 // Logging types
 type SafeLogger = logging.SafeLogger
@@ -189,6 +194,7 @@ type EmailValidationOptions = validation.EmailValidationOptions
 type ValidateFileOptions = validation.ValidateFileOptions
 type FileInput = validation.FileInput
 type ValidateFileResult = validation.ValidateFileResult
+type ValidateHostResult = validation.ValidateHostResult
 
 // Store types
 type RedisClient = stores.RedisClient
@@ -293,6 +299,14 @@ var SecureCookieMiddleware = middleware.SecureCookieMiddleware
 
 // NewCsrfProtection creates a CsrfProtection with the given options.
 var NewCsrfProtection = middleware.NewCsrfProtection
+
+// NewBruteForce creates a two-tier (fast + slow + block) brute-force limiter
+// for login / password-reset endpoints.
+var NewBruteForce = middleware.NewBruteForce
+
+// NewOverload creates a runtime-overload protector that sheds requests with 503
+// when scheduler lag indicates the server is saturated.
+var NewOverload = middleware.NewOverload
 
 // GenerateCsrfToken generates a cryptographically random CSRF token.
 var GenerateCsrfToken = middleware.GenerateCsrfToken
@@ -408,6 +422,17 @@ var DetectBot = middleware.DetectBot
 
 // BotProtection creates an http.Handler middleware for bot detection.
 var BotProtection = middleware.BotProtection
+
+// BotCorpusEntry is the wire shape of a cloud-served bot-corpus entry.
+type BotCorpusEntry = middleware.BotCorpusEntry
+
+// MergeBotPatterns merges cloud-fetched bot-corpus entries on top of the live
+// corpus (Phase C cloud refresh). Fail-open per entry; atomic swap for
+// race-free reads.
+var MergeBotPatterns = middleware.MergeBotPatterns
+
+// ResetBotPatternsForTest restores the bundled corpus (test hook).
+var ResetBotPatternsForTest = middleware.ResetBotPatternsForTest
 
 // DetectSensitivePath checks a URL path against the v1.7 W2 scanner
 // probe path list. Returns the matched pattern source (or empty string).
@@ -751,6 +776,13 @@ var HppMiddleware = middleware.HppMiddleware
 
 // ValidateFile validates a file upload for security.
 var ValidateFile = validation.ValidateFile
+
+// ValidateHost validates a Host header against an allowlist (V41 — Host-header
+// poisoning). Default-deny: an empty allowlist rejects everything (opt-in).
+var ValidateHost = validation.ValidateHost
+
+// IsHostAllowed is a boolean convenience wrapper around ValidateHost.
+var IsHostAllowed = validation.IsHostAllowed
 
 // SanitizeFilename sanitizes a filename for safe storage.
 var SanitizeFilename = validation.SanitizeFilename

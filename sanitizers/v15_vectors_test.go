@@ -148,22 +148,42 @@ func TestScanThreats_XPathClassifiesAsXPath(t *testing.T) {
 }
 
 func TestScanThreats_SqlBeforeXPathInOrdering(t *testing.T) {
-	// Cross-SDK parity note: Go's current SQL detector doesn't match
-	// the bare `1' OR '1'='1` shape that Python's does. Because of
-	// this, the same payload classifies as 'xpath' in Go but 'sql' in
-	// Python — a pre-existing Pattern 7 divergence the new XPath
-	// detector surfaces. Worth fixing in a follow-up by aligning the
-	// SQL regex across SDKs.
-	//
-	// For now, this test pins the ordering: WHEN a payload matches
-	// BOTH SQL and XPath patterns, SQL wins. Use a payload Go's SQL
-	// regex actually catches.
+	// Pins the ordering: WHEN a payload matches BOTH SQL and XPath
+	// patterns, SQL wins.
 	hit := ScanThreats("' UNION SELECT password FROM users--")
 	if hit == nil {
 		t.Fatal("expected ScanThreats to return a hit")
 	}
 	if hit.Vector != "sql" {
 		t.Errorf("expected vector=sql (UNION SELECT shape), got %q", hit.Vector)
+	}
+}
+
+func TestScanThreats_QuotedBooleanClassifiesAsSql(t *testing.T) {
+	// Cross-SDK parity (resolves the prior divergence noted here): the bare
+	// `1' OR '1'='1` tautology arrives with the trailing quote unterminated.
+	// The quoted-boolean SQL rule now makes that closing quote optional, so Go
+	// catches it as `sql` — matching Node + Python instead of falling through
+	// to xpath.
+	for _, payload := range []string{
+		"1' OR '1'='1",
+		"' OR '1'='1",
+		"admin' OR '1'='1",
+		"x' AND '1'='1",
+	} {
+		hit := ScanThreats(payload)
+		if hit == nil {
+			t.Fatalf("expected a hit on %q", payload)
+		}
+		if hit.Vector != "sql" {
+			t.Errorf("payload %q: expected vector=sql, got %q", payload, hit.Vector)
+		}
+	}
+	// Benign quoted text must still pass clean.
+	for _, benign := range []string{"O'Brien", "author = 'John'"} {
+		if hit := ScanThreats(benign); hit != nil {
+			t.Errorf("benign %q should not be flagged, got vector=%q", benign, hit.Vector)
+		}
 	}
 }
 

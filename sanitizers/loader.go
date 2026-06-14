@@ -73,11 +73,12 @@ type patternRule struct {
 // `init()`; consumers in `sanitize.go` and `standalone.go`
 // reference them directly.
 var (
-	loadedPatterns  patternSpec
-	xssPatterns     []*regexp.Regexp
-	sqlPatterns     []*regexp.Regexp
-	pathPatterns    []*regexp.Regexp
-	commandPatterns []*regexp.Regexp
+	loadedPatterns      patternSpec
+	xssPatterns         []*regexp.Regexp
+	sqlPatterns         []*regexp.Regexp
+	pathPatterns        []*regexp.Regexp
+	commandPatterns     []*regexp.Regexp
+	nosqlStringPatterns []*regexp.Regexp
 )
 
 // init parses the embedded JSON and compiles each category. Panics
@@ -93,6 +94,11 @@ func init() {
 	sqlPatterns = compileCategory("sql_injection")
 	pathPatterns = compileCategory("path_traversal")
 	commandPatterns = compileCategory("command_injection")
+	// String-form NoSQL operators (`$where`, `$ne` in a string value, not
+	// an object key). nosqlDangerousKeys handles the key form; this catches
+	// operators that arrive as strings. Matches Python's _NOSQL_DETECT and
+	// closes the Go-vs-Python NoSQL string parity gap.
+	nosqlStringPatterns = compileCategory("nosql_injection")
 }
 
 // compileCategory turns the rule list for a category into the

@@ -67,10 +67,8 @@ package gin
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,83 +77,11 @@ import (
 	"github.com/gin-gonic/gin"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/intelligence"
+	"github.com/getarcis/arcis-go/pipeline"
 	"github.com/getarcis/arcis-go/telemetry"
+	"github.com/getarcis/arcis-go/utils"
 )
-
-// scanRequestForThreats peeks at JSON body, query params, and URL path for
-// the gin/echo block-mode middlewares. Returns the first hit or nil.
-// Restores the request body so handlers can re-read it.
-func scanRequestForThreats(req *http.Request) *arcis.ThreatHit {
-	// 1. Body (JSON or form). Read once, restore unconditionally so the
-	// downstream handler can re-bind regardless of whether we found a
-	// threat, the JSON parsed, or the body was empty. Bug history: an
-	// earlier version only restored the body inside `if err == nil &&
-	// len(raw) > 0`, which broke empty POSTs and non-JSON requests sent
-	// with `Content-Type: application/json`.
-	ct := req.Header.Get("Content-Type")
-	if req.Body != nil && (strings.HasPrefix(ct, "application/json") ||
-		strings.HasPrefix(ct, "application/x-www-form-urlencoded")) {
-		raw, err := io.ReadAll(req.Body)
-		if err == nil {
-			// Always restore the body and re-set Content-Length so frameworks
-			// that double-check the header against actual bytes pass through.
-			req.Body = io.NopCloser(bytes.NewReader(raw))
-			req.ContentLength = int64(len(raw))
-
-			if len(raw) > 0 && strings.HasPrefix(ct, "application/json") {
-				var parsed interface{}
-				if json.Unmarshal(raw, &parsed) == nil {
-					if hit := arcis.ScanThreats(parsed); hit != nil {
-						return hit
-					}
-				}
-			} else if len(raw) > 0 && strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
-				// Form data: reflect into a map[string]interface{} so ScanThreats
-				// can walk it the same way as JSON. Errors are non-fatal.
-				if values, err := url.ParseQuery(string(raw)); err == nil {
-					form := make(map[string]interface{}, len(values))
-					for k, vals := range values {
-						if len(vals) == 1 {
-							form[k] = vals[0]
-						} else {
-							arr := make([]interface{}, len(vals))
-							for i, v := range vals {
-								arr[i] = v
-							}
-							form[k] = arr
-						}
-					}
-					if hit := arcis.ScanThreats(form); hit != nil {
-						return hit
-					}
-				}
-			}
-		}
-	}
-	// 2. Query params
-	q := map[string]interface{}{}
-	for k, vals := range req.URL.Query() {
-		if len(vals) == 1 {
-			q[k] = vals[0]
-		} else {
-			arr := make([]interface{}, len(vals))
-			for i, v := range vals {
-				arr[i] = v
-			}
-			q[k] = arr
-		}
-	}
-	if len(q) > 0 {
-		if hit := arcis.ScanThreats(q); hit != nil {
-			return hit
-		}
-	}
-	// 3. URL path
-	if hit := arcis.ScanThreats(req.URL.Path); hit != nil {
-		return hit
-	}
-	return nil
-}
 
 // Config holds Arcis middleware configuration for Gin.
 type Config struct {
@@ -235,15 +161,14 @@ type Config struct {
 	// prompt-injection / jailbreak / tool-call-forgery signatures and
 	// denied at or above MinPromptSeverity (default "medium"). Set
 	// PromptInjection=false to disable.
-	PromptInjection    bool
-	MinPromptSeverity  string
+	PromptInjection   bool
+	MinPromptSeverity string
 
 	// ForwardedHeaders inspection (v1.7 W7). When true, a loopback address
 	// in a forwarded/client-IP header is denied (spoofing). TrustedHosts,
 	// if set, also rejects Host / X-Forwarded-Host not in the allowlist.
 	ForwardedHeaders bool
 	TrustedHosts     []string
-
 
 	// Security headers options
 	Headers           bool
@@ -263,6 +188,14 @@ type Config struct {
 	// middleware decision. Nil = zero overhead (no defer registered, no
 	// allocations) per spec/API_SPEC.md §9 Guarantees.
 	Telemetry *telemetry.Client
+
+	// Intelligence, if non-nil, enables opt-in cloud IP reputation. On each
+	// request the client IP is looked up (cache-first, non-blocking); when the
+	// verdict severity is at or above IntelligenceBlockThreshold, the request
+	// is denied with 403. Nil = no IP-reputation work. Reputation is a signal,
+	// not a default gate: a threshold of 0 (or omitted) is observe-only.
+	Intelligence               *intelligence.Client
+	IntelligenceBlockThreshold int
 }
 
 // SanitizeEvent is the payload passed to Config.OnSanitize when a
@@ -471,6 +404,28 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 
 	registerInstance(instance)
 
+	// Bot-corpus cloud refresh (Phase C). When the intelligence client has
+	// "bot-corpus" enabled, fetch the corpus once on startup (background
+	// goroutine) and merge it on top of the bundled corpus, so newly-curated
+	// scanners / AI crawlers are classified without an SDK release. Fail-open:
+	// FetchBotCorpus returns nil on error, leaving the bundled corpus intact.
+	if config.Intelligence != nil && config.Intelligence.BotCorpusEnabled() {
+		go func() {
+			entries := config.Intelligence.FetchBotCorpus()
+			if len(entries) == 0 {
+				return
+			}
+			merged := make([]arcis.BotCorpusEntry, len(entries))
+			for i, e := range entries {
+				merged[i] = arcis.BotCorpusEntry{
+					ID: e.ID, Name: e.Name, Category: e.Category,
+					Patterns: e.Patterns, Forbidden: e.Forbidden,
+				}
+			}
+			arcis.MergeBotPatterns(merged)
+		}()
+	}
+
 	return func(c *gin.Context) {
 		start := time.Now()
 		// Per-request telemetry locals. Deny branches mutate these before
@@ -536,6 +491,27 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
 					"vector": "header", "rule": "header/untrusted-host",
+				})
+				return
+			}
+		}
+
+		// Cloud IP reputation (opt-in). Runs after forwarded-header inspection
+		// and before scanner/bot/rate-limit so a known-bad IP is blocked before
+		// consuming quota. Cache-first and non-blocking: a miss never adds
+		// latency, and an unreachable service fails open. Skipped in dry-run.
+		if config.Intelligence != nil && !config.DryRun {
+			ip := utils.DetectClientIP(c.Request, nil)
+			rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, ip)
+			if block {
+				decision = telemetry.DecisionDeny
+				evtVector = "ip-reputation"
+				evtRule = "ip-reputation/known-bad"
+				evtSeverity = telemetry.Severity(intelligence.ReputationSeverityTier(rep.Severity))
+				evtReason = "IP reputation severity exceeds threshold"
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+					"vector": "ip-reputation", "rule": "ip-reputation/known-bad",
 				})
 				return
 			}
@@ -698,7 +674,7 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 
 		// Block mode: scan body / query / path for attack patterns.
 		if config.Block {
-			if hit := scanRequestForThreats(c.Request); hit != nil {
+			if hit := pipeline.ScanRequestForThreats(c.Request); hit != nil {
 				// In dry-run mode the telemetry decision is "would_deny"
 				// so dashboards can graph false-positive rate before the
 				// switch flips. In real-deny mode it's "deny".
@@ -891,6 +867,57 @@ func RateLimitWithSkip(max int, window time.Duration, skip func(*gin.Context) bo
 			return
 		}
 
+		c.Next()
+	}
+}
+
+// BruteForce returns standalone brute-force protection middleware for login /
+// password-reset routes. Build the limiter once and keep the reference so the
+// app can call b.Reset(key) after a successful authentication and b.Close() on
+// shutdown:
+//
+//	bf := arcis.NewBruteForce(arcis.BruteForceConfig{})
+//	defer bf.Close()
+//	r.POST("/login", arcisgin.BruteForce(bf), loginHandler)
+func BruteForce(b *arcis.BruteForce) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		res := b.Check(c.Request)
+		if !res.Allowed {
+			retryAfter := int(res.RetryAfter.Seconds())
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			c.Header("Retry-After", strconv.Itoa(retryAfter))
+			c.AbortWithStatusJSON(b.StatusCode(), gin.H{
+				"error":      b.Message(),
+				"retryAfter": retryAfter,
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
+// Overload returns standalone runtime-overload protection middleware that sheds
+// requests with 503 when the server is saturated. Build it once and Close() it
+// on shutdown:
+//
+//	ol := arcis.NewOverload(arcis.OverloadConfig{})
+//	defer ol.Close()
+//	r.Use(arcisgin.Overload(ol))
+func Overload(o *arcis.Overload) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if o.ExposeLagHeaderEnabled() {
+			c.Header("X-EventLoop-Lag", strconv.Itoa(int(o.CurrentLagMs()+0.5)))
+		}
+		if o.Overloaded() {
+			c.Header("Retry-After", strconv.Itoa(o.RetryAfterSeconds()))
+			c.AbortWithStatusJSON(o.StatusCode(), gin.H{
+				"error":      o.Message(),
+				"retryAfter": o.RetryAfterSeconds(),
+			})
+			return
+		}
 		c.Next()
 	}
 }

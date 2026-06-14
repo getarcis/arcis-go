@@ -68,10 +68,8 @@ package echo
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,73 +78,11 @@ import (
 	"github.com/labstack/echo/v4"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/intelligence"
+	"github.com/getarcis/arcis-go/pipeline"
 	"github.com/getarcis/arcis-go/sanitizers"
 	"github.com/getarcis/arcis-go/telemetry"
 )
-
-// scanRequestForThreats is a shared helper for block-mode middleware that
-// peeks at JSON or form body, query, and URL path. Always restores the
-// body and Content-Length so handlers can re-bind regardless of whether
-// a threat was found, the body parsed, or the body was empty.
-func scanRequestForThreats(req *http.Request) *arcis.ThreatHit {
-	ct := req.Header.Get("Content-Type")
-	if req.Body != nil && (strings.HasPrefix(ct, "application/json") ||
-		strings.HasPrefix(ct, "application/x-www-form-urlencoded")) {
-		raw, err := io.ReadAll(req.Body)
-		if err == nil {
-			req.Body = io.NopCloser(bytes.NewReader(raw))
-			req.ContentLength = int64(len(raw))
-
-			if len(raw) > 0 && strings.HasPrefix(ct, "application/json") {
-				var parsed interface{}
-				if json.Unmarshal(raw, &parsed) == nil {
-					if hit := arcis.ScanThreats(parsed); hit != nil {
-						return hit
-					}
-				}
-			} else if len(raw) > 0 && strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
-				if values, err := url.ParseQuery(string(raw)); err == nil {
-					form := make(map[string]interface{}, len(values))
-					for k, vals := range values {
-						if len(vals) == 1 {
-							form[k] = vals[0]
-						} else {
-							arr := make([]interface{}, len(vals))
-							for i, v := range vals {
-								arr[i] = v
-							}
-							form[k] = arr
-						}
-					}
-					if hit := arcis.ScanThreats(form); hit != nil {
-						return hit
-					}
-				}
-			}
-		}
-	}
-	q := map[string]interface{}{}
-	for k, vals := range req.URL.Query() {
-		if len(vals) == 1 {
-			q[k] = vals[0]
-		} else {
-			arr := make([]interface{}, len(vals))
-			for i, v := range vals {
-				arr[i] = v
-			}
-			q[k] = arr
-		}
-	}
-	if len(q) > 0 {
-		if hit := arcis.ScanThreats(q); hit != nil {
-			return hit
-		}
-	}
-	if hit := arcis.ScanThreats(req.URL.Path); hit != nil {
-		return hit
-	}
-	return nil
-}
 
 // Config holds Arcis middleware configuration for Echo.
 type Config struct {
@@ -237,6 +173,14 @@ type Config struct {
 	// middleware decision. Nil = zero overhead (no defer registered, no
 	// allocations) per spec/API_SPEC.md §9 Guarantees.
 	Telemetry *telemetry.Client
+
+	// Intelligence, if non-nil, enables opt-in cloud IP reputation. On each
+	// request the client IP is looked up (cache-first, non-blocking); when the
+	// verdict severity is at or above IntelligenceBlockThreshold, the request
+	// is denied with 403. Nil = no IP-reputation work. Reputation is a signal,
+	// not a default gate: a threshold of 0 (or omitted) is observe-only.
+	Intelligence               *intelligence.Client
+	IntelligenceBlockThreshold int
 }
 
 // DefaultConfig returns the default Arcis configuration for Echo.
@@ -451,6 +395,28 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 
 	registerInstance(instance)
 
+	// Bot-corpus cloud refresh (Phase C). When the intelligence client has
+	// "bot-corpus" enabled, fetch the corpus once on startup (background
+	// goroutine) and merge it on top of the bundled corpus, so newly-curated
+	// scanners / AI crawlers are classified without an SDK release. Fail-open:
+	// FetchBotCorpus returns nil on error, leaving the bundled corpus intact.
+	if config.Intelligence != nil && config.Intelligence.BotCorpusEnabled() {
+		go func() {
+			entries := config.Intelligence.FetchBotCorpus()
+			if len(entries) == 0 {
+				return
+			}
+			merged := make([]arcis.BotCorpusEntry, len(entries))
+			for i, e := range entries {
+				merged[i] = arcis.BotCorpusEntry{
+					ID: e.ID, Name: e.Name, Category: e.Category,
+					Patterns: e.Patterns, Forbidden: e.Forbidden,
+				}
+			}
+			arcis.MergeBotPatterns(merged)
+		}()
+	}
+
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			start := time.Now()
@@ -515,6 +481,25 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 					return c.JSON(http.StatusForbidden, map[string]interface{}{
 						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
 						"vector": "header", "rule": "header/untrusted-host",
+					})
+				}
+			}
+
+			// Cloud IP reputation (opt-in). After forwarded-header inspection,
+			// before scanner/bot/rate-limit so a known-bad IP is blocked before
+			// consuming quota. Cache-first + non-blocking: a miss adds no latency,
+			// an unreachable service fails open. Skipped in dry-run.
+			if config.Intelligence != nil && !config.DryRun {
+				rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, c.RealIP())
+				if block {
+					decision = telemetry.DecisionDeny
+					evtVector = "ip-reputation"
+					evtRule = "ip-reputation/known-bad"
+					evtSeverity = telemetry.Severity(intelligence.ReputationSeverityTier(rep.Severity))
+					evtReason = "IP reputation severity exceeds threshold"
+					return c.JSON(http.StatusForbidden, map[string]interface{}{
+						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+						"vector": "ip-reputation", "rule": "ip-reputation/known-bad",
 					})
 				}
 			}
@@ -666,7 +651,7 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 
 			// Block mode: scan body / query / path for attack patterns.
 			if config.Block {
-				if hit := scanRequestForThreats(c.Request()); hit != nil {
+				if hit := pipeline.ScanRequestForThreats(c.Request()); hit != nil {
 					if config.DryRun {
 						decision = telemetry.Decision("would_deny")
 					} else {
@@ -854,6 +839,50 @@ func RateLimitWithSkip(max int, window time.Duration, skip func(echo.Context) bo
 				})
 			}
 
+			return next(c)
+		}
+	}
+}
+
+// BruteForce returns standalone brute-force protection middleware for login /
+// password-reset routes. Build the limiter once, keep the reference for
+// b.Reset(key) after a successful auth, and b.Close() on shutdown.
+func BruteForce(b *arcis.BruteForce) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			res := b.Check(c.Request())
+			if !res.Allowed {
+				retryAfter := int(res.RetryAfter.Seconds())
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				return c.JSON(b.StatusCode(), map[string]interface{}{
+					"error":      b.Message(),
+					"retryAfter": retryAfter,
+				})
+			}
+			return next(c)
+		}
+	}
+}
+
+// Overload returns standalone runtime-overload protection middleware that sheds
+// requests with 503 when the server is saturated. Build it once, Close() on
+// shutdown.
+func Overload(o *arcis.Overload) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if o.ExposeLagHeaderEnabled() {
+				c.Response().Header().Set("X-EventLoop-Lag", strconv.Itoa(int(o.CurrentLagMs()+0.5)))
+			}
+			if o.Overloaded() {
+				c.Response().Header().Set("Retry-After", strconv.Itoa(o.RetryAfterSeconds()))
+				return c.JSON(o.StatusCode(), map[string]interface{}{
+					"error":      o.Message(),
+					"retryAfter": o.RetryAfterSeconds(),
+				})
+			}
 			return next(c)
 		}
 	}

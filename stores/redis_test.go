@@ -190,14 +190,28 @@ func TestRedisStore_Increment_Multiple(t *testing.T) {
 	}
 }
 
-func TestRedisStore_Increment_FailOpen(t *testing.T) {
+func TestRedisStore_Increment_OutageClimbsViaFallback(t *testing.T) {
+	// During a Redis outage the counter must keep climbing via the in-memory
+	// fallback so the limit still trips. The prior behavior (returning 1 on
+	// every failed Increment) was a pure bypass: every request looked like the
+	// first and the limiter never tripped. This is the cross-SDK parity fix
+	// (Node/Python fall back to an in-memory store on a store error).
 	mock := newMockRedis()
 	mock.fail = true
 	store := NewRedisRateLimitStore(mock, nil)
 
-	count := store.Increment("user1")
-	if count != 1 {
-		t.Errorf("On error should fail-open with count 1, got %d", count)
+	if c := store.Increment("user1"); c != 1 {
+		t.Errorf("first increment during outage should be 1, got %d", c)
+	}
+	if c := store.Increment("user1"); c != 2 {
+		t.Errorf("second increment during outage should be 2 (not a bypass), got %d", c)
+	}
+	if c := store.Increment("user1"); c != 3 {
+		t.Errorf("third increment during outage should be 3, got %d", c)
+	}
+	// A different key is independent.
+	if c := store.Increment("user2"); c != 1 {
+		t.Errorf("independent key should start at 1, got %d", c)
 	}
 }
 
@@ -231,14 +245,45 @@ func TestRedisStore_Get_NotExists(t *testing.T) {
 	}
 }
 
-func TestRedisStore_Get_FailOpen(t *testing.T) {
+func TestRedisStore_Get_OutageEmptyFallbackIsNil(t *testing.T) {
+	// During an outage, a key never seen by the fallback returns nil. This
+	// preserves fail-open-on-missing-key: the caller then Sets {Count:1}, which
+	// the fallback records, and subsequent requests climb (see the test below).
 	mock := newMockRedis()
 	mock.fail = true
 	store := NewRedisRateLimitStore(mock, nil)
 
-	entry := store.Get("user1")
-	if entry != nil {
-		t.Error("Expected nil on error (fail-open)")
+	if entry := store.Get("user1"); entry != nil {
+		t.Error("Expected nil for a key the fallback has never seen during an outage")
+	}
+}
+
+func TestRedisStore_OutageMaintainsRateLimit(t *testing.T) {
+	// End-to-end outage flow mirroring how the RateLimiter drives the store:
+	// Get -> (Set if nil) -> Increment. With Redis down the count must persist
+	// and climb across requests so a limiter with max=N actually trips, rather
+	// than every request being treated as the first (pure bypass).
+	mock := newMockRedis()
+	mock.fail = true
+	store := NewRedisRateLimitStore(mock, nil)
+
+	const maxRequests = 3
+	tripped := false
+	for i := 1; i <= 6; i++ {
+		entry := store.Get("client")
+		var count int
+		if entry == nil {
+			store.Set("client", &core.RateLimitEntry{Count: 1, ResetTime: time.Now().Add(time.Minute)})
+			count = 1
+		} else {
+			count = store.Increment("client")
+		}
+		if count > maxRequests {
+			tripped = true
+		}
+	}
+	if !tripped {
+		t.Error("rate limit never tripped during a Redis outage — protection was bypassed")
 	}
 }
 

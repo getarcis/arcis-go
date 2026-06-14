@@ -166,6 +166,23 @@ func DetectXXE(input string) bool {
 	return false
 }
 
+// DetectNoSQLString checks if a string value contains a MongoDB operator
+// token (`$where`, `$ne`, `[$gt]`, ...). DetectNoSQLInjection only inspects
+// object keys; this catches operators carried as string values, e.g. the
+// query param `user[$ne]=1` (which reaches the handler as the literal `$ne`)
+// or a mongo-shell payload `$where: '1==1'`. Mirrors Python's _NOSQL_DETECT.
+func DetectNoSQLString(input string) bool {
+	if input == "" {
+		return false
+	}
+	for _, pattern := range nosqlStringPatterns {
+		if pattern.MatchString(input) {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectNoSQLInjection checks if a map contains NoSQL injection operators.
 // It recursively walks the map up to maxDepth levels deep.
 func DetectNoSQLInjection(data map[string]interface{}, maxDepth int) bool {
@@ -362,6 +379,13 @@ func scanThreatsDepth(data interface{}, depth, maxDepth int) *ThreatHit {
 		// header-crlf-set-cookie, header-smuggling-content-length.
 		if DetectHeaderInjectionStrict(n) {
 			return &ThreatHit{Vector: "header", Rule: "header/match", MatchedPattern: sample}
+		}
+		// String-form NoSQL operator carried in a string value rather than an
+		// object key. Last in the chain so more-specific detectors win; this
+		// only catches operator tokens that would otherwise pass through.
+		// Closes the Go-vs-Python NoSQL string parity gap.
+		if DetectNoSQLString(n) {
+			return &ThreatHit{Vector: "nosql", Rule: "nosql/string", MatchedPattern: sample}
 		}
 		return nil
 	}

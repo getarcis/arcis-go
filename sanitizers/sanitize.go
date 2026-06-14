@@ -71,6 +71,10 @@ var sstiDetectPatterns = []*regexp.Regexp{
 	// Velocity #set/#foreach + OGNL/Velocity method calls ($rt.exec,
 	// .getRuntime). Benchmark ssti-velocity-runtime.
 	regexp.MustCompile(`(?i)#set\s*\(\s*\$|#foreach\s*\(\s*\$|\$\w+\.(?:exec|getClass|getRuntime|getMethod|invoke)\b`),
+	// Laravel Blade raw-PHP directive: @php(...) inline or @php ... @endphp block
+	// (the {{ }} Blade echo form is already covered above). Requires @php( or the
+	// @endphp close so it doesn't fire on the bare "@php" social handle.
+	regexp.MustCompile(`(?i)@php\s*\(|@endphp\b`),
 }
 
 // SSTI removal patterns — narrowed to avoid false positives on legitimate ${name}.

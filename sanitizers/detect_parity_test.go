@@ -41,6 +41,14 @@ type parityBlock struct {
 	SSTINegative    []parityCase `json:"ssti_negative"`
 	XXEPositive     []parityCase `json:"xxe_positive"`
 	XXENegative     []parityCase `json:"xxe_negative"`
+	NoSQLPositive   []parityCase `json:"nosql_positive"`
+	NoSQLNegative   []parityCase `json:"nosql_negative"`
+	PromptInjPos    []parityCase `json:"prompt_injection_positive"`
+	PromptInjNeg    []parityCase `json:"prompt_injection_negative"`
+	DeserPos        []parityCase `json:"deserialization_positive"`
+	DeserNeg        []parityCase `json:"deserialization_negative"`
+	GraphqlPos      []parityCase `json:"graphql_positive"`
+	GraphqlNeg      []parityCase `json:"graphql_negative"`
 }
 
 type specRoot struct {
@@ -124,5 +132,23 @@ func TestDetectParity(t *testing.T) {
 	})
 	t.Run("xxe", func(t *testing.T) {
 		runDetectorParity(t, "DetectXXE", DetectXXE, parity.XXEPositive, parity.XXENegative)
+	})
+	t.Run("nosql", func(t *testing.T) {
+		runDetectorParity(t, "DetectNoSQLString", DetectNoSQLString,
+			parity.NoSQLPositive, parity.NoSQLNegative)
+	})
+	t.Run("prompt_injection", func(t *testing.T) {
+		runDetectorParity(t, "DetectPromptInjection",
+			func(s string) bool { return DetectPromptInjection(s).Detected },
+			parity.PromptInjPos, parity.PromptInjNeg)
+	})
+	t.Run("deserialization", func(t *testing.T) {
+		runDetectorParity(t, "DetectDeserialization",
+			func(s string) bool { return DetectDeserialization(s) != DeserializeNone },
+			parity.DeserPos, parity.DeserNeg)
+	})
+	t.Run("graphql", func(t *testing.T) {
+		runDetectorParity(t, "DetectGraphqlAbuse", DetectGraphqlAbuse,
+			parity.GraphqlPos, parity.GraphqlNeg)
 	})
 }
