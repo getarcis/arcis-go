@@ -194,6 +194,7 @@ type EmailValidationOptions = validation.EmailValidationOptions
 type ValidateFileOptions = validation.ValidateFileOptions
 type FileInput = validation.FileInput
 type ValidateFileResult = validation.ValidateFileResult
+type ValidateHostResult = validation.ValidateHostResult
 
 // Store types
 type RedisClient = stores.RedisClient
@@ -775,6 +776,13 @@ var HppMiddleware = middleware.HppMiddleware
 
 // ValidateFile validates a file upload for security.
 var ValidateFile = validation.ValidateFile
+
+// ValidateHost validates a Host header against an allowlist (V41 — Host-header
+// poisoning). Default-deny: an empty allowlist rejects everything (opt-in).
+var ValidateHost = validation.ValidateHost
+
+// IsHostAllowed is a boolean convenience wrapper around ValidateHost.
+var IsHostAllowed = validation.IsHostAllowed
 
 // SanitizeFilename sanitizes a filename for safe storage.
 var SanitizeFilename = validation.SanitizeFilename
