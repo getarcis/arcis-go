@@ -7,7 +7,7 @@ import (
 )
 
 // Version is the current version of Arcis.
-const Version = "1.1.0"
+const Version = "1.2.0"
 
 // MaxRecursionDepth is the maximum depth for recursive operations.
 const MaxRecursionDepth = 10
