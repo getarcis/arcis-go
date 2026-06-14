@@ -72,114 +72,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/pipeline"
 	"github.com/getarcis/arcis-go/telemetry"
 )
-
-// scanRequestForThreats peeks at JSON or form body, query, and URL path
-// for the block-mode middleware. Returns the first hit or nil. Restores
-// the request body unconditionally so the handler can re-bind regardless
-// of whether a threat was found, the body parsed, or the body was empty.
-//
-// Duplicated (byte-for-byte) from gin/gin.go and echo/echo.go. The owned-
-// files boundary blocks consolidation here; a future janitor pass can
-// extract this to packages/arcis-go/internal/scanutil/ in one cross-cutting
-// commit that touches all three adapters together.
-func scanRequestForThreats(req *http.Request) *arcis.ThreatHit {
-	ct := req.Header.Get("Content-Type")
-	if req.Body != nil && (strings.HasPrefix(ct, "application/json") ||
-		strings.HasPrefix(ct, "application/x-www-form-urlencoded") ||
-		strings.HasPrefix(ct, "application/xml") ||
-		strings.HasPrefix(ct, "text/xml")) {
-		raw, err := io.ReadAll(req.Body)
-		if err == nil {
-			req.Body = io.NopCloser(bytes.NewReader(raw))
-			req.ContentLength = int64(len(raw))
-
-			if len(raw) > 0 && (strings.HasPrefix(ct, "application/xml") || strings.HasPrefix(ct, "text/xml")) {
-				// XML body (XXE / YAML-ruby vectors): scan the raw markup as
-				// a string. Parity with the Python middleware + Node proxy.
-				if hit := arcis.ScanThreats(string(raw)); hit != nil {
-					return hit
-				}
-			} else if len(raw) > 0 && strings.HasPrefix(ct, "application/json") {
-				var parsed interface{}
-				if json.Unmarshal(raw, &parsed) == nil {
-					if hit := arcis.ScanThreats(parsed); hit != nil {
-						return hit
-					}
-				}
-			} else if len(raw) > 0 && strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
-				if values, err := url.ParseQuery(string(raw)); err == nil {
-					form := make(map[string]interface{}, len(values))
-					for k, vals := range values {
-						if len(vals) == 1 {
-							form[k] = vals[0]
-						} else {
-							arr := make([]interface{}, len(vals))
-							for i, v := range vals {
-								arr[i] = v
-							}
-							form[k] = arr
-						}
-					}
-					if hit := arcis.ScanThreats(form); hit != nil {
-						return hit
-					}
-				}
-			}
-		}
-	}
-	q := map[string]interface{}{}
-	for k, vals := range req.URL.Query() {
-		if len(vals) == 1 {
-			q[k] = vals[0]
-		} else {
-			arr := make([]interface{}, len(vals))
-			for i, v := range vals {
-				arr[i] = v
-			}
-			q[k] = arr
-		}
-	}
-	if len(q) > 0 {
-		if hit := arcis.ScanThreats(q); hit != nil {
-			return hit
-		}
-	}
-	if hit := arcis.ScanThreats(req.URL.Path); hit != nil {
-		return hit
-	}
-	return nil
-}
-
-// clientIP returns the request's client IP. Honors X-Forwarded-For (first
-// comma-separated value) then X-Real-IP, falling back to the host portion
-// of RemoteAddr. Mirrors gin's ClientIP() and echo's RealIP() so the
-// telemetry IP field stays consistent across adapters.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-		return strings.TrimSpace(xrip)
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
-}
 
 // statusWriter wraps http.ResponseWriter to capture the response status
 // code for telemetry on the allow path (where the handler may write any
@@ -421,7 +323,7 @@ func emitRateLimitDeny(tc *telemetry.Client, r *http.Request, start time.Time) {
 	}
 	tc.Send(telemetry.Event{
 		Ts:        time.Now().UTC().Format(time.RFC3339),
-		IP:        clientIP(r),
+		IP:        pipeline.ClientIP(r),
 		Method:    r.Method,
 		Path:      r.URL.Path,
 		Decision:  telemetry.DecisionDeny,
@@ -521,7 +423,7 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 					}
 					config.Telemetry.Send(telemetry.Event{
 						Ts:             time.Now().UTC().Format(time.RFC3339),
-						IP:             clientIP(r),
+						IP:             pipeline.ClientIP(r),
 						Method:         r.Method,
 						Path:           r.URL.Path,
 						Decision:       decision,
@@ -701,7 +603,7 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 			}
 
 			if config.Block {
-				if hit := scanRequestForThreats(r); hit != nil {
+				if hit := pipeline.ScanRequestForThreats(r); hit != nil {
 					if config.DryRun {
 						decision = telemetry.Decision("would_deny")
 					} else {

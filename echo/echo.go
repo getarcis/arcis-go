@@ -68,10 +68,8 @@ package echo
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,73 +78,10 @@ import (
 	"github.com/labstack/echo/v4"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/pipeline"
 	"github.com/getarcis/arcis-go/sanitizers"
 	"github.com/getarcis/arcis-go/telemetry"
 )
-
-// scanRequestForThreats is a shared helper for block-mode middleware that
-// peeks at JSON or form body, query, and URL path. Always restores the
-// body and Content-Length so handlers can re-bind regardless of whether
-// a threat was found, the body parsed, or the body was empty.
-func scanRequestForThreats(req *http.Request) *arcis.ThreatHit {
-	ct := req.Header.Get("Content-Type")
-	if req.Body != nil && (strings.HasPrefix(ct, "application/json") ||
-		strings.HasPrefix(ct, "application/x-www-form-urlencoded")) {
-		raw, err := io.ReadAll(req.Body)
-		if err == nil {
-			req.Body = io.NopCloser(bytes.NewReader(raw))
-			req.ContentLength = int64(len(raw))
-
-			if len(raw) > 0 && strings.HasPrefix(ct, "application/json") {
-				var parsed interface{}
-				if json.Unmarshal(raw, &parsed) == nil {
-					if hit := arcis.ScanThreats(parsed); hit != nil {
-						return hit
-					}
-				}
-			} else if len(raw) > 0 && strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
-				if values, err := url.ParseQuery(string(raw)); err == nil {
-					form := make(map[string]interface{}, len(values))
-					for k, vals := range values {
-						if len(vals) == 1 {
-							form[k] = vals[0]
-						} else {
-							arr := make([]interface{}, len(vals))
-							for i, v := range vals {
-								arr[i] = v
-							}
-							form[k] = arr
-						}
-					}
-					if hit := arcis.ScanThreats(form); hit != nil {
-						return hit
-					}
-				}
-			}
-		}
-	}
-	q := map[string]interface{}{}
-	for k, vals := range req.URL.Query() {
-		if len(vals) == 1 {
-			q[k] = vals[0]
-		} else {
-			arr := make([]interface{}, len(vals))
-			for i, v := range vals {
-				arr[i] = v
-			}
-			q[k] = arr
-		}
-	}
-	if len(q) > 0 {
-		if hit := arcis.ScanThreats(q); hit != nil {
-			return hit
-		}
-	}
-	if hit := arcis.ScanThreats(req.URL.Path); hit != nil {
-		return hit
-	}
-	return nil
-}
 
 // Config holds Arcis middleware configuration for Echo.
 type Config struct {
@@ -666,7 +601,7 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 
 			// Block mode: scan body / query / path for attack patterns.
 			if config.Block {
-				if hit := scanRequestForThreats(c.Request()); hit != nil {
+				if hit := pipeline.ScanRequestForThreats(c.Request()); hit != nil {
 					if config.DryRun {
 						decision = telemetry.Decision("would_deny")
 					} else {

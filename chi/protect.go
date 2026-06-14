@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/pipeline"
 )
 
 // improvements.md §1.4 (Go variant) — composite protect factories for chi
@@ -38,7 +39,7 @@ type ProtectOptions = arcis.ProtectOptions
 // clientIP helper (X-Real-IP then the host portion of RemoteAddr). clientIP
 // already takes the first XFF hop, so this delegates straight to it.
 func protectClientIP(r *http.Request) string {
-	return clientIP(r)
+	return pipeline.ClientIP(r)
 }
 
 // protectUsername reads the JSON request body, pulls the configured
