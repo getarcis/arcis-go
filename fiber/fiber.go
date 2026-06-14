@@ -52,6 +52,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/intelligence"
 	"github.com/getarcis/arcis-go/telemetry"
 )
 
@@ -204,6 +205,14 @@ type Config struct {
 	// one TelemetryEvent per request (allow + deny). Standalone
 	// RateLimit* helpers wire telemetry via WithTelemetry (deny-only).
 	Telemetry *telemetry.Client
+
+	// Intelligence, if non-nil, enables opt-in cloud IP reputation. On each
+	// request the client IP (fiber's c.IP(), honoring TrustedProxies) is
+	// looked up (cache-first, non-blocking); when the verdict severity is at
+	// or above IntelligenceBlockThreshold, the request is denied with 403.
+	// Nil = no IP-reputation work. A threshold of 0 (or omitted) is observe-only.
+	Intelligence               *intelligence.Client
+	IntelligenceBlockThreshold int
 }
 
 // DefaultConfig returns the default Arcis configuration for Fiber.
@@ -381,6 +390,28 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 
 	registerInstance(instance)
 
+	// Bot-corpus cloud refresh (Phase C). When the intelligence client has
+	// "bot-corpus" enabled, fetch the corpus once on startup (background
+	// goroutine) and merge it on top of the bundled corpus, so newly-curated
+	// scanners / AI crawlers are classified without an SDK release. Fail-open:
+	// FetchBotCorpus returns nil on error, leaving the bundled corpus intact.
+	if config.Intelligence != nil && config.Intelligence.BotCorpusEnabled() {
+		go func() {
+			entries := config.Intelligence.FetchBotCorpus()
+			if len(entries) == 0 {
+				return
+			}
+			merged := make([]arcis.BotCorpusEntry, len(entries))
+			for i, e := range entries {
+				merged[i] = arcis.BotCorpusEntry{
+					ID: e.ID, Name: e.Name, Category: e.Category,
+					Patterns: e.Patterns, Forbidden: e.Forbidden,
+				}
+			}
+			arcis.MergeBotPatterns(merged)
+		}()
+	}
+
 	return func(c *fiber.Ctx) error {
 		start := time.Now()
 		var (
@@ -438,6 +469,29 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
 					"vector": "header", "rule": "header/untrusted-host",
+				})
+			}
+		}
+
+		// Cloud IP reputation (opt-in). After forwarded-header inspection,
+		// before scanner/bot/rate-limit so a known-bad IP is blocked before
+		// consuming quota. Cache-first + non-blocking; fails open. Skipped in
+		// dry-run. Uses fiber's c.IP() (honors TrustedProxies).
+		if config.Intelligence != nil && !config.DryRun {
+			// Copy c.IP(): it aliases a pooled fasthttp buffer that is recycled
+			// once the handler returns, but the client's cache-miss refresh runs
+			// in a background goroutine that outlives the request.
+			ip := strings.Clone(c.IP())
+			rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, ip)
+			if block {
+				decision = telemetry.DecisionDeny
+				evtVector = "ip-reputation"
+				evtRule = "ip-reputation/known-bad"
+				evtSeverity = telemetry.Severity(intelligence.ReputationSeverityTier(rep.Severity))
+				evtReason = "IP reputation severity exceeds threshold"
+				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+					"vector": "ip-reputation", "rule": "ip-reputation/known-bad",
 				})
 			}
 		}

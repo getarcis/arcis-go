@@ -78,6 +78,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/intelligence"
 	"github.com/getarcis/arcis-go/pipeline"
 	"github.com/getarcis/arcis-go/sanitizers"
 	"github.com/getarcis/arcis-go/telemetry"
@@ -172,6 +173,14 @@ type Config struct {
 	// middleware decision. Nil = zero overhead (no defer registered, no
 	// allocations) per spec/API_SPEC.md §9 Guarantees.
 	Telemetry *telemetry.Client
+
+	// Intelligence, if non-nil, enables opt-in cloud IP reputation. On each
+	// request the client IP is looked up (cache-first, non-blocking); when the
+	// verdict severity is at or above IntelligenceBlockThreshold, the request
+	// is denied with 403. Nil = no IP-reputation work. Reputation is a signal,
+	// not a default gate: a threshold of 0 (or omitted) is observe-only.
+	Intelligence               *intelligence.Client
+	IntelligenceBlockThreshold int
 }
 
 // DefaultConfig returns the default Arcis configuration for Echo.
@@ -386,6 +395,28 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 
 	registerInstance(instance)
 
+	// Bot-corpus cloud refresh (Phase C). When the intelligence client has
+	// "bot-corpus" enabled, fetch the corpus once on startup (background
+	// goroutine) and merge it on top of the bundled corpus, so newly-curated
+	// scanners / AI crawlers are classified without an SDK release. Fail-open:
+	// FetchBotCorpus returns nil on error, leaving the bundled corpus intact.
+	if config.Intelligence != nil && config.Intelligence.BotCorpusEnabled() {
+		go func() {
+			entries := config.Intelligence.FetchBotCorpus()
+			if len(entries) == 0 {
+				return
+			}
+			merged := make([]arcis.BotCorpusEntry, len(entries))
+			for i, e := range entries {
+				merged[i] = arcis.BotCorpusEntry{
+					ID: e.ID, Name: e.Name, Category: e.Category,
+					Patterns: e.Patterns, Forbidden: e.Forbidden,
+				}
+			}
+			arcis.MergeBotPatterns(merged)
+		}()
+	}
+
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			start := time.Now()
@@ -450,6 +481,25 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 					return c.JSON(http.StatusForbidden, map[string]interface{}{
 						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
 						"vector": "header", "rule": "header/untrusted-host",
+					})
+				}
+			}
+
+			// Cloud IP reputation (opt-in). After forwarded-header inspection,
+			// before scanner/bot/rate-limit so a known-bad IP is blocked before
+			// consuming quota. Cache-first + non-blocking: a miss adds no latency,
+			// an unreachable service fails open. Skipped in dry-run.
+			if config.Intelligence != nil && !config.DryRun {
+				rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, c.RealIP())
+				if block {
+					decision = telemetry.DecisionDeny
+					evtVector = "ip-reputation"
+					evtRule = "ip-reputation/known-bad"
+					evtSeverity = telemetry.Severity(intelligence.ReputationSeverityTier(rep.Severity))
+					evtReason = "IP reputation severity exceeds threshold"
+					return c.JSON(http.StatusForbidden, map[string]interface{}{
+						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+						"vector": "ip-reputation", "rule": "ip-reputation/known-bad",
 					})
 				}
 			}
