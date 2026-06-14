@@ -28,31 +28,47 @@ jobs:
       - name: go test (with race detector)
         run: go test ./... -race -timeout 5m
 
-  spec-sync:
+  data-sync:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Guards against arcis-go's spec/TEST_VECTORS.json drifting from the
-    # monorepo's authoritative copy. If the upstream repo updates the
-    # shared vectors and arcis-go isn't refreshed, TestDetectParity
-    # silently passes against stale data. This CI step compares the
-    # two by SHA-256 and fails when they diverge.
+    # Guards against arcis-go's vendored shared data drifting from the
+    # monorepo's authoritative copies. arcis-go lives in a separate repo, so
+    # the monorepo's own data-sync-check can't reach it -- this is the
+    # cross-repo half. Three files must stay byte-identical to
+    # getarcis/arcis main:
+    #   spec/TEST_VECTORS.json            <- spec/TEST_VECTORS.json
+    #   sanitizers/data/patterns.json     <- packages/core/patterns.json
+    #   middleware/data/bot_patterns.json <- packages/core/bot-patterns.json
+    # Without this, an upstream data edit that isn't mirrored here makes the
+    # parity / detector tests silently pass against stale data -- exactly how
+    # the bundled patterns.json + bot corpus drifted unnoticed before.
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch upstream spec/TEST_VECTORS.json
+      - name: Compare shared data files against getarcis/arcis main
         run: |
-          curl -fsSL \
-            "https://raw.githubusercontent.com/getarcis/arcis/main/spec/TEST_VECTORS.json" \
-            -o /tmp/upstream-TEST_VECTORS.json
-
-      - name: Compare hashes
-        run: |
-          local_sha=$(sha256sum spec/TEST_VECTORS.json | awk '{print $1}')
-          upstream_sha=$(sha256sum /tmp/upstream-TEST_VECTORS.json | awk '{print $1}')
-          echo "local:    $local_sha"
-          echo "upstream: $upstream_sha"
-          if [ "$local_sha" != "$upstream_sha" ]; then
-            echo "::error::spec/TEST_VECTORS.json has drifted from getarcis/arcis main."
-            echo "Run: cp ../arcis/spec/TEST_VECTORS.json spec/TEST_VECTORS.json"
-            exit 1
-          fi
+          base="https://raw.githubusercontent.com/getarcis/arcis/main"
+          rc=0
+          check() {
+            local local_path="$1" upstream_path="$2"
+            if ! curl -fsSL "$base/$upstream_path" -o /tmp/upstream.json; then
+              echo "::error::could not fetch $upstream_path from getarcis/arcis main"
+              rc=1
+              return
+            fi
+            local local_sha upstream_sha
+            local_sha=$(sha256sum "$local_path" | awk '{print $1}')
+            upstream_sha=$(sha256sum /tmp/upstream.json | awk '{print $1}')
+            echo "$local_path"
+            echo "  local:    $local_sha"
+            echo "  upstream: $upstream_sha"
+            if [ "$local_sha" != "$upstream_sha" ]; then
+              echo "::error::$local_path has drifted from getarcis/arcis main ($upstream_path)."
+              echo "Run: cp ../arcis/$upstream_path $local_path"
+              rc=1
+            fi
+          }
+          check spec/TEST_VECTORS.json spec/TEST_VECTORS.json
+          check sanitizers/data/patterns.json packages/core/patterns.json
+          check middleware/data/bot_patterns.json packages/core/bot-patterns.json
+          exit $rc
