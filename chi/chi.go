@@ -66,12 +66,14 @@ when your application shuts down to stop this goroutine and release resources:
 package chi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,6 +99,11 @@ type statusWriter struct {
 
 func (s *statusWriter) WriteHeader(code int) {
 	if !s.wroteHeader {
+		s.stripFingerprintHeaders()
+		if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+			s.ResponseWriter.WriteHeader(code)
+			return
+		}
 		s.status = code
 		s.wroteHeader = true
 		s.ResponseWriter.WriteHeader(code)
@@ -105,9 +112,41 @@ func (s *statusWriter) WriteHeader(code int) {
 
 func (s *statusWriter) Write(b []byte) (int, error) {
 	if !s.wroteHeader {
+		s.stripFingerprintHeaders()
 		s.wroteHeader = true
 	}
 	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusWriter) stripFingerprintHeaders() {
+	s.Header().Del("Server")
+	s.Header().Del("X-Powered-By")
+}
+
+func (s *statusWriter) FlushError() error {
+	if !s.wroteHeader {
+		s.WriteHeader(http.StatusOK)
+	}
+	return http.NewResponseController(s.ResponseWriter).Flush()
+}
+
+func (s *statusWriter) Flush() {
+	_ = s.FlushError()
+}
+
+func (s *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(s.ResponseWriter).Hijack()
+}
+
+func (s *statusWriter) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
+func (s *statusWriter) Push(target string, options *http.PushOptions) error {
+	if pusher, ok := s.ResponseWriter.(http.Pusher); ok {
+		return pusher.Push(target, options)
+	}
+	return http.ErrNotSupported
 }
 
 // Config holds Arcis middleware configuration for chi.
@@ -125,10 +164,9 @@ type Config struct {
 	// patterns and respond 403 instead of running the handler. Opt-in.
 	Block bool
 
-	// DryRun: when true (and Block is also true), run the block-mode
-	// detection pipeline but do NOT respond 403. The threat is logged +
-	// the OnSanitize callback fires + telemetry records the would-have-
-	// blocked decision. Use for safe rollout.
+	// DryRun: observe configured bundle enforcement without returning an
+	// Arcis 403 or 429. Block-mode threats fire OnSanitize and telemetry
+	// records would-have-denied decisions. Use before enforcing in production.
 	DryRun bool
 
 	// OnSanitize fires when a threat is detected in block mode. Receives
@@ -430,6 +468,12 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+			defer sw.stripFingerprintHeaders()
+			if securityHeaders != nil {
+				for key, value := range securityHeaders.GetHeaders() {
+					sw.Header().Set(key, value)
+				}
+			}
 			start := time.Now()
 			// Per-request telemetry locals. Deny branches mutate these
 			// before returning; the deferred emit (registered only when
@@ -474,61 +518,85 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 			// client-IP header is a spoof; optional trusted-host allowlist.
 			if config.ForwardedHeaders {
 				if arcis.DetectForwardedSpoof(r.Header.Get) {
-					decision = telemetry.DecisionDeny
+					if config.DryRun {
+						decision = telemetry.DecisionWouldDeny
+					} else {
+						decision = telemetry.DecisionDeny
+					}
 					evtVector = "header"
 					evtRule = "header/forwarded-loopback-spoof"
 					evtSeverity = telemetry.SeverityHigh
 					evtReason = "Loopback address in forwarded header"
-					sw.Header().Set("Content-Type", "application/json")
-					sw.WriteHeader(http.StatusForbidden)
-					sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"header","rule":"header/forwarded-loopback-spoof"}`))
-					return
+					if !config.DryRun {
+						sw.Header().Set("Content-Type", "application/json")
+						sw.WriteHeader(http.StatusForbidden)
+						sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"header","rule":"header/forwarded-loopback-spoof"}`))
+						return
+					}
 				}
 				if arcis.IsUntrustedHost(r.Header.Get, r.Host, config.TrustedHosts) {
-					decision = telemetry.DecisionDeny
+					if config.DryRun {
+						decision = telemetry.DecisionWouldDeny
+					} else {
+						decision = telemetry.DecisionDeny
+					}
 					evtVector = "header"
 					evtRule = "header/untrusted-host"
 					evtSeverity = telemetry.SeverityHigh
 					evtReason = "Untrusted Host header"
-					sw.Header().Set("Content-Type", "application/json")
-					sw.WriteHeader(http.StatusForbidden)
-					sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"header","rule":"header/untrusted-host"}`))
-					return
+					if !config.DryRun {
+						sw.Header().Set("Content-Type", "application/json")
+						sw.WriteHeader(http.StatusForbidden)
+						sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"header","rule":"header/untrusted-host"}`))
+						return
+					}
 				}
 			}
 
 			// Cloud IP reputation (opt-in). After forwarded-header inspection,
 			// before scanner/bot/rate-limit so a known-bad IP is blocked before
-			// consuming quota. Cache-first + non-blocking; fails open. Skipped in
-			// dry-run.
-			if config.Intelligence != nil && !config.DryRun {
+			// consuming quota. Cache-first + non-blocking; fails open. Dry-run
+			// observes cached decisions without returning an Arcis response.
+			if config.Intelligence != nil {
 				rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, pipeline.ClientIP(r))
 				if block {
-					decision = telemetry.DecisionDeny
+					if config.DryRun {
+						decision = telemetry.DecisionWouldDeny
+					} else {
+						decision = telemetry.DecisionDeny
+					}
 					evtVector = "ip-reputation"
 					evtRule = "ip-reputation/known-bad"
 					evtSeverity = telemetry.Severity(intelligence.ReputationSeverityTier(rep.Severity))
 					evtReason = "IP reputation severity exceeds threshold"
-					sw.Header().Set("Content-Type", "application/json")
-					sw.WriteHeader(http.StatusForbidden)
-					sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"ip-reputation","rule":"ip-reputation/known-bad"}`))
-					return
+					if !config.DryRun {
+						sw.Header().Set("Content-Type", "application/json")
+						sw.WriteHeader(http.StatusForbidden)
+						sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"ip-reputation","rule":"ip-reputation/known-bad"}`))
+						return
+					}
 				}
 			}
 
 			// Scanner-path probe blocking (v1.7 W2). Runs BEFORE bot detection.
 			if config.ScannerPaths {
 				if matched := arcis.DetectSensitivePath(r.URL.Path, nil); matched != "" {
-					decision = telemetry.DecisionDeny
+					if config.DryRun {
+						decision = telemetry.DecisionWouldDeny
+					} else {
+						decision = telemetry.DecisionDeny
+					}
 					evtVector = "scanner-path"
 					evtRule = "scanner-path/probe"
 					evtMatched = matched
 					evtSeverity = telemetry.SeverityHigh
 					evtReason = "Scanner probe path"
-					sw.Header().Set("Content-Type", "application/json")
-					sw.WriteHeader(http.StatusForbidden)
-					sw.Write([]byte(`{"error":"Access denied.","code":"SECURITY_THREAT","vector":"scanner-path"}`))
-					return
+					if !config.DryRun {
+						sw.Header().Set("Content-Type", "application/json")
+						sw.WriteHeader(http.StatusForbidden)
+						sw.Write([]byte(`{"error":"Access denied.","code":"SECURITY_THREAT","vector":"scanner-path"}`))
+						return
+					}
 				}
 			}
 
@@ -544,7 +612,11 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 						}
 					}
 					if denied {
-						decision = telemetry.DecisionDeny
+						if config.DryRun {
+							decision = telemetry.DecisionWouldDeny
+						} else {
+							decision = telemetry.DecisionDeny
+						}
 						evtVector = "bot"
 						evtRule = "bot/" + strings.ToLower(string(botRes.Category))
 						evtSeverity = telemetry.SeverityMedium
@@ -552,10 +624,12 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 						if botRes.Name != "" {
 							evtReason = "Bot detected: " + botRes.Name
 						}
-						sw.Header().Set("Content-Type", "application/json")
-						sw.WriteHeader(http.StatusForbidden)
-						sw.Write([]byte(`{"error":"Access denied."}`))
-						return
+						if !config.DryRun {
+							sw.Header().Set("Content-Type", "application/json")
+							sw.WriteHeader(http.StatusForbidden)
+							sw.Write([]byte(`{"error":"Access denied."}`))
+							return
+						}
 					}
 				}
 			}
@@ -570,26 +644,33 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 				sw.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(result.Reset.Seconds())))
 
 				if !result.Allowed {
-					decision = telemetry.DecisionDeny
+					if config.DryRun {
+						decision = telemetry.DecisionWouldDeny
+					} else {
+						decision = telemetry.DecisionDeny
+					}
 					evtVector = "rate-limit"
 					evtRule = "rate-limit/exceeded"
 					evtSeverity = telemetry.SeverityMedium
 					evtReason = "Rate limit exceeded"
 
-					sw.Header().Set("Retry-After", strconv.Itoa(int(result.Reset.Seconds())))
-					writeJSON(sw, http.StatusTooManyRequests, map[string]interface{}{
-						"error":      "Too many requests, please try again later.",
-						"retryAfter": int(result.Reset.Seconds()),
-					})
-					return
+					if !config.DryRun {
+						sw.Header().Set("Retry-After", strconv.Itoa(int(result.Reset.Seconds())))
+						writeJSON(sw, http.StatusTooManyRequests, map[string]interface{}{
+							"error":      "Too many requests, please try again later.",
+							"retryAfter": int(result.Reset.Seconds()),
+						})
+						return
+					}
 				}
 			}
 
 			// Body-driven checks (v1.7 W3 + W4 + W5 + W6). Read + restore the
 			// JSON body once, run GraphQL inspection + mass-assignment
 			// detection + SSRF URL validation + prompt-injection detection
-			// off the same bytes. Skipped in dry-run.
-			if (config.GraphQL || config.MassAssign || config.SSRF || config.PromptInjection) && !config.DryRun {
+			// off the same bytes. Dry-run restores the same bytes and records
+			// would_deny without writing a response.
+			if config.GraphQL || config.MassAssign || config.SSRF || config.PromptInjection {
 				ct := r.Header.Get("Content-Type")
 				if r.Body != nil && strings.HasPrefix(ct, "application/json") {
 					raw, err := io.ReadAll(r.Body)
@@ -598,54 +679,78 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 						r.ContentLength = int64(len(raw))
 						if config.GraphQL {
 							if gqlRes := arcis.InspectGraphqlRequestBody(raw, config.GraphQLOptions); gqlRes.Blocked {
-								decision = telemetry.DecisionDeny
+								if config.DryRun {
+									decision = telemetry.DecisionWouldDeny
+								} else {
+									decision = telemetry.DecisionDeny
+								}
 								evtVector = "graphql"
 								evtRule = "graphql/" + gqlRes.Reason
 								evtSeverity = telemetry.SeverityHigh
 								evtReason = "GraphQL " + gqlRes.Reason + " limit exceeded"
-								sw.Header().Set("Content-Type", "application/json")
-								sw.WriteHeader(http.StatusForbidden)
-								sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"graphql","rule":"graphql/` + gqlRes.Reason + `"}`))
-								return
+								if !config.DryRun {
+									sw.Header().Set("Content-Type", "application/json")
+									sw.WriteHeader(http.StatusForbidden)
+									sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"graphql","rule":"graphql/` + gqlRes.Reason + `"}`))
+									return
+								}
 							}
 						}
 						if config.MassAssign {
 							if maRes := arcis.DetectMassAssignmentJSON(raw, nil); maRes.Detected {
-								decision = telemetry.DecisionDeny
+								if config.DryRun {
+									decision = telemetry.DecisionWouldDeny
+								} else {
+									decision = telemetry.DecisionDeny
+								}
 								evtVector = "mass-assignment"
 								evtRule = "mass-assignment/sensitive-field"
 								evtSeverity = telemetry.SeverityHigh
 								evtReason = "Mass-assignment field: " + maRes.Field
-								sw.Header().Set("Content-Type", "application/json")
-								sw.WriteHeader(http.StatusForbidden)
-								sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"mass-assignment","rule":"mass-assignment/sensitive-field"}`))
-								return
+								if !config.DryRun {
+									sw.Header().Set("Content-Type", "application/json")
+									sw.WriteHeader(http.StatusForbidden)
+									sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"mass-assignment","rule":"mass-assignment/sensitive-field"}`))
+									return
+								}
 							}
 						}
 						if config.SSRF {
 							if ssrfRes := arcis.ScanForSSRFJSON(raw, nil); ssrfRes.Detected {
-								decision = telemetry.DecisionDeny
+								if config.DryRun {
+									decision = telemetry.DecisionWouldDeny
+								} else {
+									decision = telemetry.DecisionDeny
+								}
 								evtVector = "ssrf"
 								evtRule = "ssrf/blocked-url"
 								evtSeverity = telemetry.SeverityHigh
 								evtReason = "SSRF: " + ssrfRes.Reason
-								sw.Header().Set("Content-Type", "application/json")
-								sw.WriteHeader(http.StatusForbidden)
-								sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"ssrf","rule":"ssrf/blocked-url"}`))
-								return
+								if !config.DryRun {
+									sw.Header().Set("Content-Type", "application/json")
+									sw.WriteHeader(http.StatusForbidden)
+									sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"ssrf","rule":"ssrf/blocked-url"}`))
+									return
+								}
 							}
 						}
 						if config.PromptInjection {
 							if arcis.ScanPromptInjectionJSON(raw, config.MinPromptSeverity) {
-								decision = telemetry.DecisionDeny
+								if config.DryRun {
+									decision = telemetry.DecisionWouldDeny
+								} else {
+									decision = telemetry.DecisionDeny
+								}
 								evtVector = "prompt-injection"
 								evtRule = "prompt-injection/detected"
 								evtSeverity = telemetry.SeverityHigh
 								evtReason = "Prompt injection detected"
-								sw.Header().Set("Content-Type", "application/json")
-								sw.WriteHeader(http.StatusForbidden)
-								sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"prompt-injection","rule":"prompt-injection/detected"}`))
-								return
+								if !config.DryRun {
+									sw.Header().Set("Content-Type", "application/json")
+									sw.WriteHeader(http.StatusForbidden)
+									sw.Write([]byte(`{"error":"Request blocked for security reasons","code":"SECURITY_THREAT","vector":"prompt-injection","rule":"prompt-injection/detected"}`))
+									return
+								}
 							}
 						}
 					}
@@ -655,7 +760,7 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 			if config.Block {
 				if hit := pipeline.ScanRequestForThreats(r); hit != nil {
 					if config.DryRun {
-						decision = telemetry.Decision("would_deny")
+						decision = telemetry.DecisionWouldDeny
 					} else {
 						decision = telemetry.DecisionDeny
 					}
@@ -689,24 +794,12 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 				}
 			}
 
-			if securityHeaders != nil {
-				for key, value := range securityHeaders.GetHeaders() {
-					sw.Header().Set(key, value)
-				}
-			}
-
 			// Stash sanitizer in request context so handlers can fetch it
 			// via GetSanitizer(r). Stdlib equivalent of gin's c.Set / echo's
 			// c.Set.
 			ctx := context.WithValue(r.Context(), sanitizerCtxKey, sanitizer)
 			next.ServeHTTP(sw, r.WithContext(ctx))
 
-			// Strip fingerprinting headers. After the handler has written
-			// the response these deletes only mutate the Header map (the
-			// wire bytes are already sent), but match gin/echo behavior so
-			// handlers that defer the write still get the strip.
-			sw.Header().Del("Server")
-			sw.Header().Del("X-Powered-By")
 		})
 	}
 }
@@ -862,15 +955,12 @@ func HeadersWithConfig(config Config) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+			defer sw.stripFingerprintHeaders()
 			for key, value := range headers.GetHeaders() {
 				w.Header().Set(key, value)
 			}
-			next.ServeHTTP(w, r)
-			// Strip fingerprinting headers post-handler. Same caveat as
-			// MiddlewareWithConfig: this only mutates the in-memory map,
-			// effective when the handler hasn't flushed yet.
-			w.Header().Del("Server")
-			w.Header().Del("X-Powered-By")
+			next.ServeHTTP(sw, r)
 		})
 	}
 }

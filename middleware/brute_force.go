@@ -30,13 +30,13 @@ import (
 // BruteForceConfig configures the brute-force limiter. Zero values fall back
 // to the documented defaults.
 type BruteForceConfig struct {
-	FastPoints    int           // attempts allowed in the fast window (default 5)
-	FastDuration  time.Duration // fast window length (default 60s)
-	SlowPoints    int           // attempts allowed in the slow window (default 20)
-	SlowDuration  time.Duration // slow window length (default 15m)
-	BlockDuration time.Duration // block length after slow-window exhaustion (default 15m)
-	StatusCode    int           // HTTP status when denied (default 429)
-	Message       string        // response message when denied
+	FastPoints    int                        // attempts allowed in the fast window (default 5)
+	FastDuration  time.Duration              // fast window length (default 60s)
+	SlowPoints    int                        // attempts allowed in the slow window (default 20)
+	SlowDuration  time.Duration              // slow window length (default 15m)
+	BlockDuration time.Duration              // block length after slow-window exhaustion (default 15m)
+	StatusCode    int                        // HTTP status when denied (default 429)
+	Message       string                     // response message when denied
 	KeyFunc       func(*http.Request) string // key resolver (default: client IP)
 	Skip          func(*http.Request) bool   // return true to bypass for this request
 }

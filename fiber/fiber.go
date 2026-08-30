@@ -132,10 +132,9 @@ type Config struct {
 	// patterns and respond 403 instead of running the handler. Opt-in.
 	Block bool
 
-	// DryRun: when true (and Block is also true), run the block-mode
-	// detection pipeline but do NOT respond 403. The threat is logged +
-	// the OnSanitize callback fires + telemetry records the would-have-
-	// blocked decision. Use for safe rollout.
+	// DryRun: observe configured bundle enforcement without returning an
+	// Arcis 403 or 429. Block-mode threats fire OnSanitize and telemetry
+	// records would-have-denied decisions. Use before enforcing in production.
 	DryRun bool
 
 	// OnSanitize fires when a threat is detected in block mode. Receives
@@ -413,6 +412,15 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 	}
 
 	return func(c *fiber.Ctx) error {
+		if securityHeaders != nil {
+			for key, value := range securityHeaders.GetHeaders() {
+				c.Set(key, value)
+			}
+		}
+		defer func() {
+			c.Response().Header.Del("Server")
+			c.Response().Header.Del("X-Powered-By")
+		}()
 		start := time.Now()
 		var (
 			decision    = telemetry.DecisionAllow
@@ -450,66 +458,91 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 		if config.ForwardedHeaders {
 			get := func(name string) string { return c.Get(name) }
 			if arcis.DetectForwardedSpoof(get) {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "header"
 				evtRule = "header/forwarded-loopback-spoof"
 				evtSeverity = telemetry.SeverityHigh
 				evtReason = "Loopback address in forwarded header"
-				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
-					"vector": "header", "rule": "header/forwarded-loopback-spoof",
-				})
+				if !config.DryRun {
+					return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+						"vector": "header", "rule": "header/forwarded-loopback-spoof",
+					})
+				}
 			}
 			if arcis.IsUntrustedHost(get, c.Hostname(), config.TrustedHosts) {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "header"
 				evtRule = "header/untrusted-host"
 				evtSeverity = telemetry.SeverityHigh
 				evtReason = "Untrusted Host header"
-				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
-					"vector": "header", "rule": "header/untrusted-host",
-				})
+				if !config.DryRun {
+					return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+						"vector": "header", "rule": "header/untrusted-host",
+					})
+				}
 			}
 		}
 
 		// Cloud IP reputation (opt-in). After forwarded-header inspection,
 		// before scanner/bot/rate-limit so a known-bad IP is blocked before
-		// consuming quota. Cache-first + non-blocking; fails open. Skipped in
-		// dry-run. Uses fiber's c.IP() (honors TrustedProxies).
-		if config.Intelligence != nil && !config.DryRun {
+		// consuming quota. Cache-first + non-blocking; fails open. Dry-run
+		// observes cached decisions without returning an Arcis response. Uses
+		// fiber's c.IP() (honors TrustedProxies).
+		if config.Intelligence != nil {
 			// Copy c.IP(): it aliases a pooled fasthttp buffer that is recycled
 			// once the handler returns, but the client's cache-miss refresh runs
 			// in a background goroutine that outlives the request.
 			ip := strings.Clone(c.IP())
 			rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, ip)
 			if block {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "ip-reputation"
 				evtRule = "ip-reputation/known-bad"
 				evtSeverity = telemetry.Severity(intelligence.ReputationSeverityTier(rep.Severity))
 				evtReason = "IP reputation severity exceeds threshold"
-				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
-					"vector": "ip-reputation", "rule": "ip-reputation/known-bad",
-				})
+				if !config.DryRun {
+					return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+						"vector": "ip-reputation", "rule": "ip-reputation/known-bad",
+					})
+				}
 			}
 		}
 
 		// Scanner-path probe blocking (v1.7 W2). Runs BEFORE bot detection.
 		if config.ScannerPaths {
 			if matched := arcis.DetectSensitivePath(c.Path(), nil); matched != "" {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "scanner-path"
 				evtRule = "scanner-path/probe"
 				evtMatched = matched
 				evtSeverity = telemetry.SeverityHigh
 				evtReason = "Scanner probe path"
-				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-					"error":  "Access denied.",
-					"code":   "SECURITY_THREAT",
-					"vector": "scanner-path",
-				})
+				if !config.DryRun {
+					return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+						"error":  "Access denied.",
+						"code":   "SECURITY_THREAT",
+						"vector": "scanner-path",
+					})
+				}
 			}
 		}
 
@@ -543,7 +576,11 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 					}
 				}
 				if denied {
-					decision = telemetry.DecisionDeny
+					if config.DryRun {
+						decision = telemetry.DecisionWouldDeny
+					} else {
+						decision = telemetry.DecisionDeny
+					}
 					evtVector = "bot"
 					evtRule = "bot/" + strings.ToLower(string(botRes.Category))
 					evtSeverity = telemetry.SeverityMedium
@@ -551,9 +588,11 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 					if botRes.Name != "" {
 						evtReason = "Bot detected: " + botRes.Name
 					}
-					return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-						"error": "Access denied.",
-					})
+					if !config.DryRun {
+						return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+							"error": "Access denied.",
+						})
+					}
 				}
 			}
 		}
@@ -573,86 +612,117 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 			c.Set("X-RateLimit-Reset", strconv.Itoa(int(result.Reset.Seconds())))
 
 			if !result.Allowed {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "rate-limit"
 				evtRule = "rate-limit/exceeded"
 				evtSeverity = telemetry.SeverityMedium
 				evtReason = "Rate limit exceeded"
 
-				c.Set("Retry-After", strconv.Itoa(int(result.Reset.Seconds())))
-				return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-					"error":      "Too many requests, please try again later.",
-					"retryAfter": int(result.Reset.Seconds()),
-				})
+				if !config.DryRun {
+					c.Set("Retry-After", strconv.Itoa(int(result.Reset.Seconds())))
+					return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+						"error":      "Too many requests, please try again later.",
+						"retryAfter": int(result.Reset.Seconds()),
+					})
+				}
 			}
 		}
 
 		// Body-driven checks (v1.7 W3 + W4 + W5 + W6). fasthttp exposes the
 		// body via c.Body() (no stream to restore). Run GraphQL inspection
 		// + mass-assignment detection + SSRF URL validation +
-		// prompt-injection detection off the same bytes. Skipped in dry-run.
-		if (config.GraphQL || config.MassAssign || config.SSRF || config.PromptInjection) && !config.DryRun {
+		// prompt-injection detection off the same bytes. Dry-run observes
+		// without returning an Arcis response.
+		if config.GraphQL || config.MassAssign || config.SSRF || config.PromptInjection {
 			ct := c.Get("Content-Type")
 			if strings.HasPrefix(ct, "application/json") {
 				raw := c.Body()
 				if config.GraphQL {
 					if gqlRes := arcis.InspectGraphqlRequestBody(raw, config.GraphQLOptions); gqlRes.Blocked {
-						decision = telemetry.DecisionDeny
+						if config.DryRun {
+							decision = telemetry.DecisionWouldDeny
+						} else {
+							decision = telemetry.DecisionDeny
+						}
 						evtVector = "graphql"
 						evtRule = "graphql/" + gqlRes.Reason
 						evtSeverity = telemetry.SeverityHigh
 						evtReason = "GraphQL " + gqlRes.Reason + " limit exceeded"
-						return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-							"error":  "Request blocked for security reasons",
-							"code":   "SECURITY_THREAT",
-							"vector": "graphql",
-							"rule":   "graphql/" + gqlRes.Reason,
-						})
+						if !config.DryRun {
+							return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+								"error":  "Request blocked for security reasons",
+								"code":   "SECURITY_THREAT",
+								"vector": "graphql",
+								"rule":   "graphql/" + gqlRes.Reason,
+							})
+						}
 					}
 				}
 				if config.MassAssign {
 					if maRes := arcis.DetectMassAssignmentJSON(raw, nil); maRes.Detected {
-						decision = telemetry.DecisionDeny
+						if config.DryRun {
+							decision = telemetry.DecisionWouldDeny
+						} else {
+							decision = telemetry.DecisionDeny
+						}
 						evtVector = "mass-assignment"
 						evtRule = "mass-assignment/sensitive-field"
 						evtSeverity = telemetry.SeverityHigh
 						evtReason = "Mass-assignment field: " + maRes.Field
-						return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-							"error":  "Request blocked for security reasons",
-							"code":   "SECURITY_THREAT",
-							"vector": "mass-assignment",
-							"rule":   "mass-assignment/sensitive-field",
-						})
+						if !config.DryRun {
+							return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+								"error":  "Request blocked for security reasons",
+								"code":   "SECURITY_THREAT",
+								"vector": "mass-assignment",
+								"rule":   "mass-assignment/sensitive-field",
+							})
+						}
 					}
 				}
 				if config.SSRF {
 					if ssrfRes := arcis.ScanForSSRFJSON(raw, nil); ssrfRes.Detected {
-						decision = telemetry.DecisionDeny
+						if config.DryRun {
+							decision = telemetry.DecisionWouldDeny
+						} else {
+							decision = telemetry.DecisionDeny
+						}
 						evtVector = "ssrf"
 						evtRule = "ssrf/blocked-url"
 						evtSeverity = telemetry.SeverityHigh
 						evtReason = "SSRF: " + ssrfRes.Reason
-						return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-							"error":  "Request blocked for security reasons",
-							"code":   "SECURITY_THREAT",
-							"vector": "ssrf",
-							"rule":   "ssrf/blocked-url",
-						})
+						if !config.DryRun {
+							return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+								"error":  "Request blocked for security reasons",
+								"code":   "SECURITY_THREAT",
+								"vector": "ssrf",
+								"rule":   "ssrf/blocked-url",
+							})
+						}
 					}
 				}
 				if config.PromptInjection {
 					if arcis.ScanPromptInjectionJSON(raw, config.MinPromptSeverity) {
-						decision = telemetry.DecisionDeny
+						if config.DryRun {
+							decision = telemetry.DecisionWouldDeny
+						} else {
+							decision = telemetry.DecisionDeny
+						}
 						evtVector = "prompt-injection"
 						evtRule = "prompt-injection/detected"
 						evtSeverity = telemetry.SeverityHigh
 						evtReason = "Prompt injection detected"
-						return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-							"error":  "Request blocked for security reasons",
-							"code":   "SECURITY_THREAT",
-							"vector": "prompt-injection",
-							"rule":   "prompt-injection/detected",
-						})
+						if !config.DryRun {
+							return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+								"error":  "Request blocked for security reasons",
+								"code":   "SECURITY_THREAT",
+								"vector": "prompt-injection",
+								"rule":   "prompt-injection/detected",
+							})
+						}
 					}
 				}
 			}
@@ -661,7 +731,7 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 		if config.Block {
 			if hit := scanFiberCtxForThreats(c); hit != nil {
 				if config.DryRun {
-					decision = telemetry.Decision("would_deny")
+					decision = telemetry.DecisionWouldDeny
 				} else {
 					decision = telemetry.DecisionDeny
 				}
@@ -694,12 +764,6 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 			}
 		}
 
-		if securityHeaders != nil {
-			for key, value := range securityHeaders.GetHeaders() {
-				c.Set(key, value)
-			}
-		}
-
 		// Stash the sanitizer in c.Locals so handlers can pull it back
 		// via GetSanitizer(c).
 		c.Locals(sanitizerLocalKey, sanitizer)
@@ -708,9 +772,6 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 			return err
 		}
 
-		// Strip fingerprinting headers AFTER the handler ran.
-		c.Response().Header.Del("Server")
-		c.Response().Header.Del("X-Powered-By")
 		return nil
 	}
 }

@@ -99,13 +99,9 @@ type Config struct {
 	// to the handler. Opt-in (default false).
 	Block bool
 
-	// DryRun: when true (and Block is also true), run the block-mode
-	// detection pipeline but do NOT abort with 403. The threat is logged
-	// + the OnSanitize callback fires + telemetry records the would-have-
-	// blocked decision. Use for safe rollout: turn on Block=true +
-	// DryRun=true, watch the telemetry stream for false positives, then
-	// flip DryRun=false once confident.
-	// Ignored when Block=false.
+	// DryRun: observe configured bundle enforcement without returning an
+	// Arcis 403 or 429. Block-mode threats fire OnSanitize and telemetry
+	// records would-have-denied decisions. Use before enforcing in production.
 	DryRun bool
 
 	// OnSanitize fires when a threat is detected in block mode (regardless
@@ -427,6 +423,14 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 	}
 
 	return func(c *gin.Context) {
+		writer := &fingerprintWriter{ResponseWriter: c.Writer}
+		c.Writer = writer
+		defer writer.strip() // Also covers responses committed by Gin after return.
+		if securityHeaders != nil {
+			for key, value := range securityHeaders.GetHeaders() {
+				c.Header(key, value)
+			}
+		}
 		start := time.Now()
 		// Per-request telemetry locals. Deny branches mutate these before
 		// returning; the deferred emit (registered only when Telemetry is
@@ -471,67 +475,92 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 		// client-IP header is a spoof; optional trusted-host allowlist.
 		if config.ForwardedHeaders {
 			if arcis.DetectForwardedSpoof(c.GetHeader) {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "header"
 				evtRule = "header/forwarded-loopback-spoof"
 				evtSeverity = telemetry.SeverityHigh
 				evtReason = "Loopback address in forwarded header"
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
-					"vector": "header", "rule": "header/forwarded-loopback-spoof",
-				})
-				return
+				if !config.DryRun {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+						"vector": "header", "rule": "header/forwarded-loopback-spoof",
+					})
+					return
+				}
 			}
 			if arcis.IsUntrustedHost(c.GetHeader, c.Request.Host, config.TrustedHosts) {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "header"
 				evtRule = "header/untrusted-host"
 				evtSeverity = telemetry.SeverityHigh
 				evtReason = "Untrusted Host header"
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
-					"vector": "header", "rule": "header/untrusted-host",
-				})
-				return
+				if !config.DryRun {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+						"vector": "header", "rule": "header/untrusted-host",
+					})
+					return
+				}
 			}
 		}
 
 		// Cloud IP reputation (opt-in). Runs after forwarded-header inspection
 		// and before scanner/bot/rate-limit so a known-bad IP is blocked before
 		// consuming quota. Cache-first and non-blocking: a miss never adds
-		// latency, and an unreachable service fails open. Skipped in dry-run.
-		if config.Intelligence != nil && !config.DryRun {
+		// latency, and an unreachable service fails open. Dry-run observes
+		// cached decisions without returning an Arcis response.
+		if config.Intelligence != nil {
 			ip := utils.DetectClientIP(c.Request, nil)
 			rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, ip)
 			if block {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "ip-reputation"
 				evtRule = "ip-reputation/known-bad"
 				evtSeverity = telemetry.Severity(intelligence.ReputationSeverityTier(rep.Severity))
 				evtReason = "IP reputation severity exceeds threshold"
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-					"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
-					"vector": "ip-reputation", "rule": "ip-reputation/known-bad",
-				})
-				return
+				if !config.DryRun {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+						"error": "Request blocked for security reasons", "code": "SECURITY_THREAT",
+						"vector": "ip-reputation", "rule": "ip-reputation/known-bad",
+					})
+					return
+				}
 			}
 		}
 
 		// Scanner-path probe blocking (v1.7 W2). Runs BEFORE bot detection.
 		if config.ScannerPaths {
 			if matched := arcis.DetectSensitivePath(c.Request.URL.Path, nil); matched != "" {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "scanner-path"
 				evtRule = "scanner-path/probe"
 				evtMatched = matched
 				evtSeverity = telemetry.SeverityHigh
 				evtReason = "Scanner probe path"
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-					"error":  "Access denied.",
-					"code":   "SECURITY_THREAT",
-					"vector": "scanner-path",
-				})
-				return
+				if !config.DryRun {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+						"error":  "Access denied.",
+						"code":   "SECURITY_THREAT",
+						"vector": "scanner-path",
+					})
+					return
+				}
 			}
 		}
 
@@ -549,7 +578,11 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 					}
 				}
 				if denied {
-					decision = telemetry.DecisionDeny
+					if config.DryRun {
+						decision = telemetry.DecisionWouldDeny
+					} else {
+						decision = telemetry.DecisionDeny
+					}
 					evtVector = "bot"
 					evtRule = "bot/" + strings.ToLower(string(result.Category))
 					evtSeverity = telemetry.SeverityMedium
@@ -558,10 +591,12 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 						evtReason = "Bot detected: " + result.Name
 					}
 
-					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-						"error": "Access denied.",
-					})
-					return
+					if !config.DryRun {
+						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+							"error": "Access denied.",
+						})
+						return
+					}
 				}
 			}
 		}
@@ -577,27 +612,32 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 			c.Header("X-RateLimit-Reset", strconv.Itoa(int(result.Reset.Seconds())))
 
 			if !result.Allowed {
-				decision = telemetry.DecisionDeny
+				if config.DryRun {
+					decision = telemetry.DecisionWouldDeny
+				} else {
+					decision = telemetry.DecisionDeny
+				}
 				evtVector = "rate-limit"
 				evtRule = "rate-limit/exceeded"
 				evtSeverity = telemetry.SeverityMedium
 				evtReason = "Rate limit exceeded"
 
-				c.Header("Retry-After", strconv.Itoa(int(result.Reset.Seconds())))
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-					"error":      "Too many requests, please try again later.",
-					"retryAfter": int(result.Reset.Seconds()),
-				})
-				return
+				if !config.DryRun {
+					c.Header("Retry-After", strconv.Itoa(int(result.Reset.Seconds())))
+					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+						"error":      "Too many requests, please try again later.",
+						"retryAfter": int(result.Reset.Seconds()),
+					})
+					return
+				}
 			}
 		}
 
 		// Body-driven checks (v1.7 W3 + W4 + W5 + W6). Read + restore the
 		// JSON body once, then run GraphQL inspection, mass-assignment
 		// detection, SSRF URL validation, and prompt-injection detection
-		// off the same bytes. All run regardless of Block mode; skipped
-		// in dry-run.
-		if (config.GraphQL || config.MassAssign || config.SSRF || config.PromptInjection) && !config.DryRun {
+		// off the same bytes. Dry-run observes without aborting the request.
+		if config.GraphQL || config.MassAssign || config.SSRF || config.PromptInjection {
 			ct := c.Request.Header.Get("Content-Type")
 			if c.Request.Body != nil && strings.HasPrefix(ct, "application/json") {
 				raw, err := io.ReadAll(c.Request.Body)
@@ -606,66 +646,90 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 					c.Request.ContentLength = int64(len(raw))
 					if config.GraphQL {
 						if gqlRes := arcis.InspectGraphqlRequestBody(raw, config.GraphQLOptions); gqlRes.Blocked {
-							decision = telemetry.DecisionDeny
+							if config.DryRun {
+								decision = telemetry.DecisionWouldDeny
+							} else {
+								decision = telemetry.DecisionDeny
+							}
 							evtVector = "graphql"
 							evtRule = "graphql/" + gqlRes.Reason
 							evtSeverity = telemetry.SeverityHigh
 							evtReason = "GraphQL " + gqlRes.Reason + " limit exceeded"
-							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-								"error":  "Request blocked for security reasons",
-								"code":   "SECURITY_THREAT",
-								"vector": "graphql",
-								"rule":   "graphql/" + gqlRes.Reason,
-							})
-							return
+							if !config.DryRun {
+								c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+									"error":  "Request blocked for security reasons",
+									"code":   "SECURITY_THREAT",
+									"vector": "graphql",
+									"rule":   "graphql/" + gqlRes.Reason,
+								})
+								return
+							}
 						}
 					}
 					if config.MassAssign {
 						if maRes := arcis.DetectMassAssignmentJSON(raw, nil); maRes.Detected {
-							decision = telemetry.DecisionDeny
+							if config.DryRun {
+								decision = telemetry.DecisionWouldDeny
+							} else {
+								decision = telemetry.DecisionDeny
+							}
 							evtVector = "mass-assignment"
 							evtRule = "mass-assignment/sensitive-field"
 							evtSeverity = telemetry.SeverityHigh
 							evtReason = "Mass-assignment field: " + maRes.Field
-							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-								"error":  "Request blocked for security reasons",
-								"code":   "SECURITY_THREAT",
-								"vector": "mass-assignment",
-								"rule":   "mass-assignment/sensitive-field",
-							})
-							return
+							if !config.DryRun {
+								c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+									"error":  "Request blocked for security reasons",
+									"code":   "SECURITY_THREAT",
+									"vector": "mass-assignment",
+									"rule":   "mass-assignment/sensitive-field",
+								})
+								return
+							}
 						}
 					}
 					if config.SSRF {
 						if ssrfRes := arcis.ScanForSSRFJSON(raw, nil); ssrfRes.Detected {
-							decision = telemetry.DecisionDeny
+							if config.DryRun {
+								decision = telemetry.DecisionWouldDeny
+							} else {
+								decision = telemetry.DecisionDeny
+							}
 							evtVector = "ssrf"
 							evtRule = "ssrf/blocked-url"
 							evtSeverity = telemetry.SeverityHigh
 							evtReason = "SSRF: " + ssrfRes.Reason
-							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-								"error":  "Request blocked for security reasons",
-								"code":   "SECURITY_THREAT",
-								"vector": "ssrf",
-								"rule":   "ssrf/blocked-url",
-							})
-							return
+							if !config.DryRun {
+								c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+									"error":  "Request blocked for security reasons",
+									"code":   "SECURITY_THREAT",
+									"vector": "ssrf",
+									"rule":   "ssrf/blocked-url",
+								})
+								return
+							}
 						}
 					}
 					if config.PromptInjection {
 						if arcis.ScanPromptInjectionJSON(raw, config.MinPromptSeverity) {
-							decision = telemetry.DecisionDeny
+							if config.DryRun {
+								decision = telemetry.DecisionWouldDeny
+							} else {
+								decision = telemetry.DecisionDeny
+							}
 							evtVector = "prompt-injection"
 							evtRule = "prompt-injection/detected"
 							evtSeverity = telemetry.SeverityHigh
 							evtReason = "Prompt injection detected"
-							c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-								"error":  "Request blocked for security reasons",
-								"code":   "SECURITY_THREAT",
-								"vector": "prompt-injection",
-								"rule":   "prompt-injection/detected",
-							})
-							return
+							if !config.DryRun {
+								c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+									"error":  "Request blocked for security reasons",
+									"code":   "SECURITY_THREAT",
+									"vector": "prompt-injection",
+									"rule":   "prompt-injection/detected",
+								})
+								return
+							}
 						}
 					}
 				}
@@ -679,7 +743,7 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 				// so dashboards can graph false-positive rate before the
 				// switch flips. In real-deny mode it's "deny".
 				if config.DryRun {
-					decision = telemetry.Decision("would_deny")
+					decision = telemetry.DecisionWouldDeny
 				} else {
 					decision = telemetry.DecisionDeny
 				}
@@ -720,21 +784,11 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 			}
 		}
 
-		// Security headers
-		if securityHeaders != nil {
-			for key, value := range securityHeaders.GetHeaders() {
-				c.Header(key, value)
-			}
-		}
-
 		// Store sanitizer in context for use in handlers
 		c.Set("arcis_sanitizer", sanitizer)
 
 		c.Next()
 
-		// Remove fingerprinting headers after handler runs
-		c.Writer.Header().Del("Server")
-		c.Writer.Header().Del("X-Powered-By")
 	}
 }
 
@@ -759,12 +813,13 @@ func HeadersWithConfig(config Config) gin.HandlerFunc {
 	headers := arcis.NewSecurityHeaders(arcisConfig)
 
 	return func(c *gin.Context) {
+		writer := &fingerprintWriter{ResponseWriter: c.Writer}
+		c.Writer = writer
+		defer writer.strip()
 		for key, value := range headers.GetHeaders() {
 			c.Header(key, value)
 		}
 		c.Next()
-		c.Writer.Header().Del("Server")
-		c.Writer.Header().Del("X-Powered-By")
 	}
 }
 

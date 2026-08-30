@@ -104,3 +104,87 @@ func TestBlock_DisabledByDefault(t *testing.T) {
 		t.Fatalf("expected 200 in default mode, got %d", w.Code)
 	}
 }
+
+func TestBlock_DryRunPreservesRequestBody(t *testing.T) {
+	r := gin.New()
+	cfg := DefaultConfig()
+	cfg.RateLimit = false
+	cfg.Block = true
+	cfg.DryRun = true
+	r.Use(MiddlewareWithConfig(cfg))
+	r.POST("/echo", func(c *gin.Context) {
+		var body map[string]interface{}
+		_ = c.ShouldBindJSON(&body)
+		c.JSON(http.StatusOK, gin.H{"received": body})
+	})
+
+	original := `{"note":"Use the -- flag; it works","path":"docs/../README.md"}`
+	req := httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader(original))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 in dry-run mode, got %d", w.Code)
+	}
+	var response struct {
+		Received map[string]interface{} `json:"received"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("invalid response json: %v", err)
+	}
+	if response.Received["note"] != "Use the -- flag; it works" {
+		t.Fatalf("dry-run changed note: %v", response.Received["note"])
+	}
+	if response.Received["path"] != "docs/../README.md" {
+		t.Fatalf("dry-run changed path: %v", response.Received["path"])
+	}
+}
+
+func TestBlock_DryRunDoesNotEnforceRateLimit(t *testing.T) {
+	r := gin.New()
+	cfg := DefaultConfig()
+	cfg.Block = false
+	cfg.DryRun = true
+	cfg.RateLimitMax = 1
+	r.Use(MiddlewareWithConfig(cfg))
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"reached": true})
+	})
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		req.Header.Set("Accept", "text/html")
+		req.Header.Set("Accept-Language", "en-US")
+		req.Header.Set("Accept-Encoding", "gzip")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200 in dry-run mode, got %d", i+1, w.Code)
+		}
+		if w.Header().Get("Retry-After") != "" {
+			t.Fatalf("request %d: dry-run must not emit Retry-After", i+1)
+		}
+	}
+}
+
+func TestBlock_DryRunDoesNotDenyBot(t *testing.T) {
+	r := gin.New()
+	cfg := DefaultConfig()
+	cfg.Block = false
+	cfg.DryRun = true
+	cfg.RateLimit = false
+	r.Use(MiddlewareWithConfig(cfg))
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"reached": true})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("User-Agent", "sqlmap/1.7")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected bot request to reach handler in dry-run mode, got %d", w.Code)
+	}
+}

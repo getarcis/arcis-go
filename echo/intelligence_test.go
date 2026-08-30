@@ -1,6 +1,7 @@
 package echo
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/getarcis/arcis-go/intelligence"
+	"github.com/getarcis/arcis-go/telemetry"
 )
 
 const (
@@ -127,5 +129,63 @@ func TestEchoIntelInertWithoutCloudDecisions(t *testing.T) {
 	}
 	if atomic.LoadInt32(&hits) != 0 {
 		t.Fatalf("expected no lookups, got %d", hits)
+	}
+}
+
+func TestEchoIntelDryRunObservesCachedBadIPAndEmitsWouldDeny(t *testing.T) {
+	srv := intelStub(map[string]int{publicIP: 9}, nil)
+	defer srv.Close()
+	client, err := intelligence.NewClient(intelligence.Options{
+		Endpoint:       srv.URL,
+		CloudDecisions: []string{"ip-rep"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_ = client.Check(publicIP)
+	deadline := time.Now().Add(time.Second)
+	for client.CacheSize() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client.CacheSize() == 0 {
+		t.Fatal("timed out warming the IP-reputation cache")
+	}
+
+	telemetryURL, telemetryRequests := recordingServer(t)
+	tc, err := telemetry.NewClient(telemetry.Options{
+		Endpoint:      telemetryURL,
+		BatchSize:     1,
+		FlushInterval: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e := intelApp(Config{
+		Intelligence:               client,
+		IntelligenceBlockThreshold: 7,
+		DryRun:                     true,
+		Telemetry:                  tc,
+	})
+
+	if got := statusFor(e, publicIP); got != http.StatusOK {
+		t.Errorf("dry-run status = %d, want 200", got)
+	}
+	if err := tc.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	event := decodeFirstEvent(t, mustReceiveBody(t, telemetryRequests, time.Second))
+	if event.Decision != telemetry.DecisionWouldDeny {
+		t.Errorf("Decision = %q, want would_deny", event.Decision)
+	}
+	if event.Vector != "ip-reputation" {
+		t.Errorf("Vector = %q, want ip-reputation", event.Vector)
+	}
+	if event.Rule != "ip-reputation/known-bad" {
+		t.Errorf("Rule = %q, want ip-reputation/known-bad", event.Rule)
+	}
+	if event.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200", event.Status)
 	}
 }

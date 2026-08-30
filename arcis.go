@@ -221,15 +221,15 @@ const (
 
 // Bot category constants
 const (
-	BotCategorySearchEngine = middleware.BotCategorySearchEngine
-	BotCategorySocial       = middleware.BotCategorySocial
-	BotCategoryMonitoring   = middleware.BotCategoryMonitoring
-	BotCategoryAICrawler    = middleware.BotCategoryAICrawler
+	BotCategorySearchEngine    = middleware.BotCategorySearchEngine
+	BotCategorySocial          = middleware.BotCategorySocial
+	BotCategoryMonitoring      = middleware.BotCategoryMonitoring
+	BotCategoryAICrawler       = middleware.BotCategoryAICrawler
 	BotCategoryScraper         = middleware.BotCategoryScraper
 	BotCategorySecurityScanner = middleware.BotCategorySecurityScanner
 	BotCategoryAutomated       = middleware.BotCategoryAutomated
-	BotCategoryUnknown      = middleware.BotCategoryUnknown
-	BotCategoryHuman        = middleware.BotCategoryHuman
+	BotCategoryUnknown         = middleware.BotCategoryUnknown
+	BotCategoryHuman           = middleware.BotCategoryHuman
 )
 
 // PII type constants

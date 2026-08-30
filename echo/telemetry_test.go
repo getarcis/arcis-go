@@ -182,6 +182,152 @@ func TestEchoTelemetry_BlockDenyPath(t *testing.T) {
 	}
 }
 
+func TestEchoTelemetry_DryRunGraphQLPreservesBodyAndEmitsWouldDeny(t *testing.T) {
+	url, reqs := recordingServer(t)
+	tc, err := telemetry.NewClient(telemetry.Options{
+		Endpoint:      url,
+		BatchSize:     1,
+		FlushInterval: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.RateLimit = false
+	cfg.Bot = false
+	cfg.Block = false
+	cfg.DryRun = true
+	cfg.Telemetry = tc
+
+	e := echo.New()
+	e.Use(MiddlewareWithConfig(cfg))
+	e.POST("/graphql", func(c echo.Context) error {
+		body, readErr := io.ReadAll(c.Request().Body)
+		if readErr != nil {
+			return readErr
+		}
+		return c.Blob(http.StatusOK, "application/json", body)
+	})
+
+	body := `{"query":"{__schema{types{name}}}"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/graphql", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	e.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("response code = %d, want 200", w.Code)
+	}
+	if w.Body.String() != body {
+		t.Fatalf("handler body = %q, want original %q", w.Body.String(), body)
+	}
+
+	if err := tc.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	evt := decodeFirstEvent(t, mustReceiveBody(t, reqs, time.Second))
+	if evt.Decision != telemetry.DecisionWouldDeny {
+		t.Errorf("Decision = %q, want would_deny", evt.Decision)
+	}
+	if evt.Vector != "graphql" {
+		t.Errorf("Vector = %q, want graphql", evt.Vector)
+	}
+	if evt.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200", evt.Status)
+	}
+}
+
+func TestEchoTelemetry_DryRunRequestDetectorsReachHandlerAndEmitWouldDeny(t *testing.T) {
+	tests := []struct {
+		name         string
+		path         string
+		scannerPaths bool
+		headerName   string
+		headerValue  string
+		vector       string
+		rule         string
+	}{
+		{
+			name:         "scanner path",
+			path:         "/.env",
+			scannerPaths: true,
+			vector:       "scanner-path",
+			rule:         "scanner-path/probe",
+		},
+		{
+			name:         "forwarded loopback spoof",
+			path:         "/normal",
+			scannerPaths: false,
+			headerName:   "X-Forwarded-For",
+			headerValue:  "127.0.0.1",
+			vector:       "header",
+			rule:         "header/forwarded-loopback-spoof",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			url, reqs := recordingServer(t)
+			tc, err := telemetry.NewClient(telemetry.Options{
+				Endpoint:      url,
+				BatchSize:     1,
+				FlushInterval: 10 * time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cfg := DefaultConfig()
+			cfg.RateLimit = false
+			cfg.Bot = false
+			cfg.Block = false
+			cfg.ScannerPaths = testCase.scannerPaths
+			cfg.DryRun = true
+			cfg.Telemetry = tc
+
+			e := echo.New()
+			e.Use(MiddlewareWithConfig(cfg))
+			e.GET(testCase.path, func(c echo.Context) error {
+				return c.String(http.StatusOK, "application-reached")
+			})
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, testCase.path, nil)
+			req.Header.Set("User-Agent", "Mozilla/5.0")
+			if testCase.headerName != "" {
+				req.Header.Set(testCase.headerName, testCase.headerValue)
+			}
+			e.ServeHTTP(w, req)
+
+			if err := tc.Close(context.Background()); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			evt := decodeFirstEvent(t, mustReceiveBody(t, reqs, time.Second))
+
+			if w.Code != http.StatusOK {
+				t.Errorf("response code = %d, want 200", w.Code)
+			}
+			if w.Body.String() != "application-reached" {
+				t.Errorf("handler body = %q, want application-reached", w.Body.String())
+			}
+			if evt.Decision != telemetry.DecisionWouldDeny {
+				t.Errorf("Decision = %q, want would_deny", evt.Decision)
+			}
+			if evt.Vector != testCase.vector {
+				t.Errorf("Vector = %q, want %s", evt.Vector, testCase.vector)
+			}
+			if evt.Rule != testCase.rule {
+				t.Errorf("Rule = %q, want %s", evt.Rule, testCase.rule)
+			}
+			if evt.Status != http.StatusOK {
+				t.Errorf("Status = %d, want 200", evt.Status)
+			}
+		})
+	}
+}
+
 // TestEchoTelemetry_StandaloneRateLimitDeny exercises the standalone
 // RateLimit helper with WithTelemetry. Asserts the 429 emits a deny
 // event AND the preceding allow does NOT emit (Phase 2b semantic:

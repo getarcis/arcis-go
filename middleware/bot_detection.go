@@ -15,15 +15,15 @@ import (
 type BotCategory string
 
 const (
-	BotCategorySearchEngine BotCategory = "SEARCH_ENGINE"
-	BotCategorySocial       BotCategory = "SOCIAL"
-	BotCategoryMonitoring   BotCategory = "MONITORING"
-	BotCategoryAICrawler    BotCategory = "AI_CRAWLER"
+	BotCategorySearchEngine    BotCategory = "SEARCH_ENGINE"
+	BotCategorySocial          BotCategory = "SOCIAL"
+	BotCategoryMonitoring      BotCategory = "MONITORING"
+	BotCategoryAICrawler       BotCategory = "AI_CRAWLER"
 	BotCategoryScraper         BotCategory = "SCRAPER"
 	BotCategorySecurityScanner BotCategory = "SECURITY_SCANNER"
 	BotCategoryAutomated       BotCategory = "AUTOMATED"
-	BotCategoryUnknown      BotCategory = "UNKNOWN"
-	BotCategoryHuman        BotCategory = "HUMAN"
+	BotCategoryUnknown         BotCategory = "UNKNOWN"
+	BotCategoryHuman           BotCategory = "HUMAN"
 )
 
 // BotDetectionResult holds the result of bot detection.
@@ -80,9 +80,9 @@ type botPatternRaw struct {
 // matching disqualifies the entry. `(?i)` prefix makes each regex
 // case-insensitive — matches the Node + Python SDKs' contract.
 var (
-	botPatternsAtomic atomic.Value // []botPattern
+	botPatternsAtomic  atomic.Value // []botPattern
 	bundledBotPatterns []botPattern
-	mergeMu           sync.Mutex // serializes concurrent merges
+	mergeMu            sync.Mutex // serializes concurrent merges
 )
 
 func currentBotPatterns() []botPattern {

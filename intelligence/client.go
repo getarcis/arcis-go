@@ -35,14 +35,14 @@ const (
 //  4. A clean ("not found") result IS cached so clean IPs are not re-queried;
 //     transport errors are NOT cached so they retry.
 type Client struct {
-	base         string
-	apiKey       string
-	workspaceID  string
+	base             string
+	apiKey           string
+	workspaceID      string
 	timeout          time.Duration
 	ipRepEnabled     bool
 	botCorpusEnabled bool
 	onError          func(error)
-	httpClient   *http.Client
+	httpClient       *http.Client
 
 	cache *lruCache
 
@@ -97,9 +97,9 @@ func NewClient(opts Options) (*Client, error) {
 		ipRepEnabled:     ipRep,
 		botCorpusEnabled: botCorpus,
 		onError:          onError,
-		httpClient:   &http.Client{Timeout: timeout},
-		cache:        newLRUCache(cacheMax, ttl),
-		inFlight:     make(map[string]struct{}),
+		httpClient:       &http.Client{Timeout: timeout},
+		cache:            newLRUCache(cacheMax, ttl),
+		inFlight:         make(map[string]struct{}),
 	}, nil
 }
 

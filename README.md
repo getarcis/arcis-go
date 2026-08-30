@@ -1,6 +1,6 @@
 # Arcis Go SDK
 
-Security middleware for Go web applications, with the same detection surface as the Node and Python SDKs. The core is stdlib-only. Adapters for Gin, Echo, chi, Fiber, and net/http each import only their own router (chi works with any router that accepts a stdlib `func(http.Handler) http.Handler`; the `nethttp` re-export covers users without a third-party router).
+Security middleware for Go web applications, developed against a shared policy and conformance target with the Node and Python SDKs. The core is stdlib-only. Adapters for Gin, Echo, chi, Fiber, and net/http each import only their own router (chi works with any router that accepts a stdlib `func(http.Handler) http.Handler`; the `nethttp` re-export covers users without a third-party router).
 
 Arcis detects and sanitizes XSS, SQL injection, NoSQL injection, path traversal, command injection, prototype pollution, SSTI, XXE, LDAP injection, XPath injection, and header injection.
 
@@ -26,6 +26,49 @@ The default request path covers XSS, SQL, NoSQL, path traversal, command injecti
 - **Scanner-path and per-IP correlation** tracking, **GraphQL** abuse limits, **mass-assignment** detection, **SSRF** checks on URL body fields, and **prompt-injection** screening.
 
 Each layer can be disabled through its config option. The request body is read once and restored, so handlers can re-bind it without parser issues.
+
+## Safe dry-run rollout
+
+```go
+cfg := arcisgin.DefaultConfig()
+cfg.Block = true
+cfg.DryRun = true
+cfg.Telemetry = tc
+r.Use(arcisgin.MiddlewareWithConfig(cfg))
+```
+
+`DryRun: true` takes precedence over configured bundle enforcement. Arcis
+continues evaluating cached IP reputation, forwarded headers, scanner paths,
+bots, rate limits, request-body detectors, and block-mode threat patterns, but
+it does not return an Arcis `403` or `429`. Request body bytes, parsed values,
+query values, route parameters, headers, and cookies remain unchanged. A
+request that would have been rejected is emitted as telemetry decision
+`would_deny` with the application's response status. Response security headers
+may still be added.
+
+## Adapter capability matrix
+
+`MiddlewareWithConfig` is the full bundled request pipeline. A full bundle
+includes request detection, dry-run and blocking decisions, bot and rate
+controls, response security headers, telemetry, and request-body restoration.
+
+| Adapter | Full bundle | Shared dry-run fixtures | Real-server smoke suite | Granular helper surface | Limitation or framework behavior |
+| --- | --- | --- | --- | --- | --- |
+| Gin | Yes | Yes | Yes | Full | Gin-native `gin.HandlerFunc` middleware. |
+| Echo | Yes | Yes | Yes | Full | Echo-native `echo.MiddlewareFunc` middleware. |
+| Chi | Yes | Yes | Yes | Full | Runtime middleware is stdlib-compatible and does not require Chi. |
+| Fiber | Yes | Yes | Yes | Narrower | Exposes bundle, rate, brute-force, overload, protection, and sanitizer lookup helpers. Fiber leaves wildcard route parameters percent-encoded unless the application enables `fiber.Config.UnescapePath`; Arcis preserves the framework value. |
+| net/http | Yes | Yes | Yes | Narrower re-export | Exposes bundle, rate, protection, and sanitizer lookup helpers. Import the stdlib-compatible Chi package for granular headers, sanitizer, validation, CSRF, cookie, CORS, and error middleware. |
+
+The real-server suite sends the shared invoice, Unicode catalog, URL, and
+free-text fixtures through actual loopback listeners. It also checks attack
+enforcement, bot and rate-limit allow/deny paths, unchanged bodies in enforcing
+and dry-run modes, headers against shared fixtures, concurrent limiter and
+telemetry decisions, and repeated cleanup. Gin, Echo, and Chi have additional
+standalone-header coverage; Chi also has streaming, connection-upgrade, and
+HTTP/2 response-control checks. See [conformance evidence](CONFORMANCE.md) for
+the test map, reproduction commands, and limitations. These smoke tests do not
+establish exhaustive protection coverage or feature parity with other tools.
 
 ## Quick start (Gin)
 

@@ -46,8 +46,8 @@ func TestBruteForce_SlowWindowTripsBlock(t *testing.T) {
 		FastDuration: time.Hour, SlowDuration: time.Hour, BlockDuration: 30 * time.Minute})
 	defer b.Close()
 
-	_ = b.CheckKey("ip1") // slow=1
-	_ = b.CheckKey("ip1") // slow=2
+	_ = b.CheckKey("ip1")  // slow=1
+	_ = b.CheckKey("ip1")  // slow=2
 	r := b.CheckKey("ip1") // slow=3 > 2 => block
 	if r.Allowed {
 		t.Fatal("3rd attempt should trip the slow-window block")

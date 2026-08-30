@@ -1,7 +1,9 @@
 package fiber
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -12,6 +14,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"github.com/getarcis/arcis-go/intelligence"
+	"github.com/getarcis/arcis-go/telemetry"
 )
 
 const (
@@ -133,5 +136,86 @@ func TestFiberIntelInertWithoutCloudDecisions(t *testing.T) {
 	}
 	if atomic.LoadInt32(&hits) != 0 {
 		t.Fatalf("expected no lookups, got %d", hits)
+	}
+}
+
+func TestFiberIntelDryRunObservesCachedBadIPAndEmitsWouldDeny(t *testing.T) {
+	srv := intelStub(map[string]int{publicIP: 9}, nil)
+	defer srv.Close()
+	client, err := intelligence.NewClient(intelligence.Options{
+		Endpoint:       srv.URL,
+		CloudDecisions: []string{"ip-rep"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_ = client.Check(publicIP)
+	deadline := time.Now().Add(time.Second)
+	for client.CacheSize() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client.CacheSize() == 0 {
+		t.Fatal("timed out warming the IP-reputation cache")
+	}
+
+	telemetryRequests := make(chan []byte, 1)
+	telemetryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		telemetryRequests <- body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer telemetryServer.Close()
+	tc, err := telemetry.NewClient(telemetry.Options{
+		Endpoint:      telemetryServer.URL,
+		BatchSize:     1,
+		FlushInterval: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := intelApp(Config{
+		Intelligence:               client,
+		IntelligenceBlockThreshold: 7,
+		DryRun:                     true,
+		Telemetry:                  tc,
+	})
+	defer Cleanup()
+
+	if got := statusFor(t, app, publicIP); got != http.StatusOK {
+		t.Errorf("dry-run status = %d, want 200", got)
+	}
+	if err := tc.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var telemetryBody []byte
+	select {
+	case telemetryBody = <-telemetryRequests:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for telemetry POST")
+	}
+	var envelope struct {
+		Events []telemetry.Event `json:"events"`
+	}
+	if err := json.Unmarshal(telemetryBody, &envelope); err != nil {
+		t.Fatalf("decode telemetry batch: %v (body=%q)", err, telemetryBody)
+	}
+	if len(envelope.Events) != 1 {
+		t.Fatalf("got %d events, want 1", len(envelope.Events))
+	}
+	event := envelope.Events[0]
+	if event.Decision != telemetry.DecisionWouldDeny {
+		t.Errorf("Decision = %q, want would_deny", event.Decision)
+	}
+	if event.Vector != "ip-reputation" {
+		t.Errorf("Vector = %q, want ip-reputation", event.Vector)
+	}
+	if event.Rule != "ip-reputation/known-bad" {
+		t.Errorf("Rule = %q, want ip-reputation/known-bad", event.Rule)
+	}
+	if event.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200", event.Status)
 	}
 }

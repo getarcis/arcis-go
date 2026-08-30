@@ -8,6 +8,7 @@ const (
 	DecisionAllow     Decision = "allow"
 	DecisionDeny      Decision = "deny"
 	DecisionChallenge Decision = "challenge"
+	DecisionWouldDeny Decision = "would_deny"
 )
 
 // Severity is the finding severity for a denied/challenged request.

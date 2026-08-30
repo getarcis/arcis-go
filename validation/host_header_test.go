@@ -7,9 +7,9 @@ var hostAllow = []string{"app.example.com", "*.tenant.example.com"}
 func TestValidateHost_Allows(t *testing.T) {
 	for _, host := range []string{
 		"app.example.com",
-		"app.example.com:443",       // port stripped
-		"APP.EXAMPLE.COM",           // case-insensitive
-		"a.tenant.example.com",      // one-level wildcard
+		"app.example.com:443",  // port stripped
+		"APP.EXAMPLE.COM",      // case-insensitive
+		"a.tenant.example.com", // one-level wildcard
 		"b.tenant.example.com:8080",
 	} {
 		if !ValidateHost(host, hostAllow).Safe {

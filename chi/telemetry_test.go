@@ -203,6 +203,61 @@ func TestChiTelemetry_BlockDenyPath(t *testing.T) {
 	}
 }
 
+func TestChiTelemetry_DryRunGraphQLPreservesBodyAndEmitsWouldDeny(t *testing.T) {
+	url, reqs := recordingServer(t)
+	tc, err := telemetry.NewClient(telemetry.Options{
+		Endpoint:      url,
+		BatchSize:     1,
+		FlushInterval: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.RateLimit = false
+	cfg.Bot = false
+	cfg.Block = false
+	cfg.DryRun = true
+	cfg.Telemetry = tc
+
+	r := chirouter.NewRouter()
+	r.Use(MiddlewareWithConfig(cfg))
+	r.Post("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.Copy(w, r.Body)
+	})
+	t.Cleanup(Cleanup)
+
+	body := `{"query":"{__schema{types{name}}}"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/graphql", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("response code = %d, want 200", w.Code)
+	}
+	if w.Body.String() != body {
+		t.Fatalf("handler body = %q, want original %q", w.Body.String(), body)
+	}
+
+	if err := tc.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	evt := decodeFirstEvent(t, mustReceiveBody(t, reqs, time.Second))
+	if evt.Decision != telemetry.DecisionWouldDeny {
+		t.Errorf("Decision = %q, want would_deny", evt.Decision)
+	}
+	if evt.Vector != "graphql" {
+		t.Errorf("Vector = %q, want graphql", evt.Vector)
+	}
+	if evt.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200", evt.Status)
+	}
+}
+
 // TestChiTelemetry_StandaloneRateLimitDeny pins the Phase 2b semantic:
 // standalone RateLimit + WithTelemetry emits on deny only. Two requests
 // (allow then deny) must produce exactly ONE telemetry POST with the
