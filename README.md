@@ -77,6 +77,34 @@ message, so mistakes surface at startup. Use
 `arcis.NewBaselineSecurityHeaders` for an error return instead. Headers are set
 before your handler runs, so a header the handler sets itself wins.
 
+## HTML sanitizer
+
+For fields that intentionally accept HTML (comments, rich text, CMS content),
+the `htmlsanitizer` package produces the same output as DOMPurify 3.4 with the
+same configuration, using `golang.org/x/net/html` instead of a browser DOM.
+
+```go
+import "github.com/getarcis/arcis-go/htmlsanitizer"
+
+clean := htmlsanitizer.Sanitize(`<p>Hi<img src=x onerror=alert(1)></p>`) // <p>Hi<img src="x"></p>
+
+s, err := htmlsanitizer.New(htmlsanitizer.Config{
+	AllowedTags: []string{"b", "i", "a"},
+	AllowedAttr: []string{"href"},
+})
+if err != nil {
+	log.Fatal(err)
+}
+result := s.SanitizeDetailed(dirty) // result.HTML, result.Removed
+```
+
+A `Sanitizer` is safe for concurrent use. Config fields are named after
+DOMPurify's options. The package must reproduce DOMPurify's exact output on
+the 668 shared cases in `spec/html-sanitizer-vectors.json`; where
+`x/net/html` builds a different tree than the parser DOMPurify uses on the
+server, the Go sanitizer removes more, never less. DOMPurify attribution is in
+[THIRDPARTY-LICENSES.md](THIRDPARTY-LICENSES.md).
+
 ## Adapter capability matrix
 
 `MiddlewareWithConfig` is the full bundled request pipeline. A full bundle
