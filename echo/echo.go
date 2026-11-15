@@ -164,6 +164,23 @@ type Config struct {
 	CacheControl      bool
 	CacheControlValue string // Custom Cache-Control value. Empty = use secure default.
 
+	// Cross-origin isolation headers (legacy profile), as in arcis.Config.
+	CrossOriginOpenerPolicy   string
+	CrossOriginResourcePolicy string
+	CrossOriginEmbedderPolicy string
+	OriginAgentCluster        bool
+	DNSPrefetchControl        bool
+
+	// HeaderProfile selects the header defaults: empty or
+	// arcis.HeaderProfileLegacy uses the fields above;
+	// arcis.HeaderProfileBaseline uses BaselineHeaders (Helmet 8
+	// compatible). An invalid baseline configuration makes
+	// MiddlewareWithConfig and HeadersWithConfig panic. With
+	// BaselineHeaders.ContentSecurityPolicy.Nonce, handlers read the nonce
+	// with arcis.CSPNonce(c.Request().Context()).
+	HeaderProfile   arcis.HeaderProfile
+	BaselineHeaders arcis.BaselineHeaderOptions
+
 	// Error handler options
 	IsDev bool
 
@@ -212,7 +229,62 @@ func DefaultConfig() Config {
 		ReferrerPolicy:    "strict-origin-when-cross-origin",
 		PermissionsPolicy: "geolocation=(), microphone=(), camera=()",
 		CacheControl:      true,
-		IsDev:             false,
+
+		CrossOriginOpenerPolicy:   "same-origin",
+		CrossOriginResourcePolicy: "same-origin",
+		CrossOriginEmbedderPolicy: "require-corp",
+		OriginAgentCluster:        true,
+		DNSPrefetchControl:        true,
+
+		IsDev: false,
+	}
+}
+
+// compileSecurityHeaders compiles the header settings in config. It
+// panics on an unknown HeaderProfile or invalid BaselineHeaders, so the
+// mistake surfaces when the middleware is built rather than per request.
+func compileSecurityHeaders(config Config) *arcis.SecurityHeaders {
+	headers, err := arcis.CompileSecurityHeaders(arcis.Config{
+		CSP:                       config.CSP,
+		FrameOptions:              config.FrameOptions,
+		HSTSMaxAge:                config.HSTSMaxAge,
+		HSTSSubdomains:            config.HSTSSubdomains,
+		ReferrerPolicy:            config.ReferrerPolicy,
+		PermissionsPolicy:         config.PermissionsPolicy,
+		CacheControl:              config.CacheControl,
+		CacheControlValue:         config.CacheControlValue,
+		CrossOriginOpenerPolicy:   config.CrossOriginOpenerPolicy,
+		CrossOriginResourcePolicy: config.CrossOriginResourcePolicy,
+		CrossOriginEmbedderPolicy: config.CrossOriginEmbedderPolicy,
+		OriginAgentCluster:        config.OriginAgentCluster,
+		DNSPrefetchControl:        config.DNSPrefetchControl,
+		HeaderProfile:             config.HeaderProfile,
+		BaselineHeaders:           config.BaselineHeaders,
+	})
+	if err != nil {
+		panic("arcis echo adapter: invalid security header configuration: " + err.Error())
+	}
+	return headers
+}
+
+// applySecurityHeaders sets the security headers before the handler runs,
+// so a header the route sets itself wins. The error comes from a CSP
+// function value and should be returned to Echo's error handler.
+func applySecurityHeaders(c echo.Context, headers *arcis.SecurityHeaders) error {
+	req, err := headers.Apply(c.Response().Header(), c.Request())
+	if err != nil {
+		return err
+	}
+	c.SetRequest(req)
+	return nil
+}
+
+// stripFingerprintHeaders removes Server, and X-Powered-By unless the
+// baseline profile keeps it. headers may be nil (headers disabled).
+func stripFingerprintHeaders(c echo.Context, headers *arcis.SecurityHeaders) {
+	c.Response().Header().Del("Server")
+	if headers == nil || headers.RemovesPoweredBy() {
+		c.Response().Header().Del("X-Powered-By")
 	}
 }
 
@@ -351,26 +423,24 @@ func Middleware() echo.MiddlewareFunc {
 func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 	// Convert to core Arcis config
 	arcisConfig := arcis.Config{
-		Sanitize:          config.Sanitize,
-		SanitizeXSS:       config.SanitizeXSS,
-		SanitizeSQL:       config.SanitizeSQL,
-		SanitizeNoSQL:     config.SanitizeNoSQL,
-		SanitizePath:      config.SanitizePath,
-		SanitizeCmd:       config.SanitizeCmd,
-		MaxInputSize:      config.MaxInputSize,
-		RateLimit:         config.RateLimit,
-		RateLimitMax:      config.RateLimitMax,
-		RateLimitWindow:   config.RateLimitWindow,
-		Headers:           config.Headers,
-		CSP:               config.CSP,
-		FrameOptions:      config.FrameOptions,
-		HSTSMaxAge:        config.HSTSMaxAge,
-		HSTSSubdomains:    config.HSTSSubdomains,
-		ReferrerPolicy:    config.ReferrerPolicy,
-		PermissionsPolicy: config.PermissionsPolicy,
-		CacheControl:      config.CacheControl,
-		CacheControlValue: config.CacheControlValue,
-		IsDev:             config.IsDev,
+		Sanitize:        config.Sanitize,
+		SanitizeXSS:     config.SanitizeXSS,
+		SanitizeSQL:     config.SanitizeSQL,
+		SanitizeNoSQL:   config.SanitizeNoSQL,
+		SanitizePath:    config.SanitizePath,
+		SanitizeCmd:     config.SanitizeCmd,
+		MaxInputSize:    config.MaxInputSize,
+		RateLimit:       config.RateLimit,
+		RateLimitMax:    config.RateLimitMax,
+		RateLimitWindow: config.RateLimitWindow,
+		IsDev:           config.IsDev,
+	}
+
+	// Compile headers first: invalid configuration panics before any
+	// background goroutine starts.
+	var securityHeaders *arcis.SecurityHeaders
+	if config.Headers {
+		securityHeaders = compileSecurityHeaders(config)
 	}
 
 	sanitizer := arcis.NewSanitizer(arcisConfig)
@@ -384,11 +454,6 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 			rateLimiter = arcis.NewRateLimiter(config.RateLimitMax, config.RateLimitWindow)
 		}
 		instance.rateLimiter = rateLimiter
-	}
-
-	var securityHeaders *arcis.SecurityHeaders
-	if config.Headers {
-		securityHeaders = arcis.NewSecurityHeaders(arcisConfig)
 	}
 
 	registerInstance(instance)
@@ -417,13 +482,10 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) (returnedErr error) {
-			c.Response().Before(func() {
-				c.Response().Header().Del("Server")
-				c.Response().Header().Del("X-Powered-By")
-			})
+			c.Response().Before(func() { stripFingerprintHeaders(c, securityHeaders) })
 			if securityHeaders != nil {
-				for key, value := range securityHeaders.GetHeaders() {
-					c.Response().Header().Set(key, value)
+				if err := applySecurityHeaders(c, securityHeaders); err != nil {
+					return err
 				}
 			}
 			start := time.Now()
@@ -767,8 +829,7 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 			applicationPending = false
 
 			// Also clear the mutable map for handlers that defer their write.
-			c.Response().Header().Del("Server")
-			c.Response().Header().Del("X-Powered-By")
+			stripFingerprintHeaders(c, securityHeaders)
 
 			return err
 		}
@@ -781,32 +842,18 @@ func Headers() echo.MiddlewareFunc {
 }
 
 // HeadersWithConfig returns a headers middleware with custom configuration.
+// It panics on an invalid header configuration (see Config.HeaderProfile).
 func HeadersWithConfig(config Config) echo.MiddlewareFunc {
-	arcisConfig := arcis.Config{
-		CSP:               config.CSP,
-		FrameOptions:      config.FrameOptions,
-		HSTSMaxAge:        config.HSTSMaxAge,
-		HSTSSubdomains:    config.HSTSSubdomains,
-		ReferrerPolicy:    config.ReferrerPolicy,
-		PermissionsPolicy: config.PermissionsPolicy,
-		CacheControl:      config.CacheControl,
-		CacheControlValue: config.CacheControlValue,
-	}
-
-	headers := arcis.NewSecurityHeaders(arcisConfig)
+	headers := compileSecurityHeaders(config)
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			c.Response().Before(func() {
-				c.Response().Header().Del("Server")
-				c.Response().Header().Del("X-Powered-By")
-			})
-			for key, value := range headers.GetHeaders() {
-				c.Response().Header().Set(key, value)
+			c.Response().Before(func() { stripFingerprintHeaders(c, headers) })
+			if err := applySecurityHeaders(c, headers); err != nil {
+				return err
 			}
 			err := next(c)
-			c.Response().Header().Del("Server")
-			c.Response().Header().Del("X-Powered-By")
+			stripFingerprintHeaders(c, headers)
 			return err
 		}
 	}

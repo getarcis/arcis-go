@@ -50,6 +50,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/adaptor"
 
 	arcis "github.com/getarcis/arcis-go"
 	"github.com/getarcis/arcis-go/intelligence"
@@ -197,6 +198,24 @@ type Config struct {
 	CacheControl      bool
 	CacheControlValue string
 
+	// Cross-origin isolation headers (legacy profile), as in arcis.Config.
+	CrossOriginOpenerPolicy   string
+	CrossOriginResourcePolicy string
+	CrossOriginEmbedderPolicy string
+	OriginAgentCluster        bool
+	DNSPrefetchControl        bool
+
+	// HeaderProfile selects the header defaults: empty or
+	// arcis.HeaderProfileLegacy uses the fields above;
+	// arcis.HeaderProfileBaseline uses BaselineHeaders (Helmet 8
+	// compatible). An invalid baseline configuration makes
+	// MiddlewareWithConfig panic. With
+	// BaselineHeaders.ContentSecurityPolicy.Nonce, handlers read the nonce
+	// with arcis.CSPNonce(c.UserContext()). CSP function values receive
+	// the request converted to *http.Request.
+	HeaderProfile   arcis.HeaderProfile
+	BaselineHeaders arcis.BaselineHeaderOptions
+
 	// Error handler options
 	IsDev bool
 
@@ -245,7 +264,78 @@ func DefaultConfig() Config {
 		ReferrerPolicy:    "strict-origin-when-cross-origin",
 		PermissionsPolicy: "geolocation=(), microphone=(), camera=()",
 		CacheControl:      true,
-		IsDev:             false,
+
+		CrossOriginOpenerPolicy:   "same-origin",
+		CrossOriginResourcePolicy: "same-origin",
+		CrossOriginEmbedderPolicy: "require-corp",
+		OriginAgentCluster:        true,
+		DNSPrefetchControl:        true,
+
+		IsDev: false,
+	}
+}
+
+// compileSecurityHeaders compiles the header settings in config. It
+// panics on an unknown HeaderProfile or invalid BaselineHeaders, so the
+// mistake surfaces when the middleware is built rather than per request.
+func compileSecurityHeaders(config Config) *arcis.SecurityHeaders {
+	headers, err := arcis.CompileSecurityHeaders(arcis.Config{
+		CSP:                       config.CSP,
+		FrameOptions:              config.FrameOptions,
+		HSTSMaxAge:                config.HSTSMaxAge,
+		HSTSSubdomains:            config.HSTSSubdomains,
+		ReferrerPolicy:            config.ReferrerPolicy,
+		PermissionsPolicy:         config.PermissionsPolicy,
+		CacheControl:              config.CacheControl,
+		CacheControlValue:         config.CacheControlValue,
+		CrossOriginOpenerPolicy:   config.CrossOriginOpenerPolicy,
+		CrossOriginResourcePolicy: config.CrossOriginResourcePolicy,
+		CrossOriginEmbedderPolicy: config.CrossOriginEmbedderPolicy,
+		OriginAgentCluster:        config.OriginAgentCluster,
+		DNSPrefetchControl:        config.DNSPrefetchControl,
+		HeaderProfile:             config.HeaderProfile,
+		BaselineHeaders:           config.BaselineHeaders,
+	})
+	if err != nil {
+		panic("arcis fiber adapter: invalid security header configuration: " + err.Error())
+	}
+	return headers
+}
+
+// applySecurityHeaders sets the security headers before the handler runs,
+// so a header the route sets itself wins. A per-request CSP (nonce or
+// function values) gets the request converted to *http.Request, and the
+// nonce is stored on c.UserContext(). The error comes from a CSP function
+// value and should be returned to Fiber's error handler.
+func applySecurityHeaders(c *fiber.Ctx, headers *arcis.SecurityHeaders) error {
+	var req *http.Request
+	if headers.Dynamic() {
+		converted, err := adaptor.ConvertRequest(c, false)
+		if err != nil {
+			return err
+		}
+		req = converted.WithContext(c.UserContext())
+	}
+	h := make(http.Header, len(headers.GetHeaders())+1)
+	req, err := headers.Apply(h, req)
+	if err != nil {
+		return err
+	}
+	if req != nil {
+		c.SetUserContext(req.Context())
+	}
+	for name, values := range h {
+		c.Set(name, values[0])
+	}
+	return nil
+}
+
+// stripFingerprintHeaders removes Server, and X-Powered-By unless the
+// baseline profile keeps it. headers may be nil (headers disabled).
+func stripFingerprintHeaders(c *fiber.Ctx, headers *arcis.SecurityHeaders) {
+	c.Response().Header.Del("Server")
+	if headers == nil || headers.RemovesPoweredBy() {
+		c.Response().Header.Del("X-Powered-By")
 	}
 }
 
@@ -347,26 +437,24 @@ func Middleware() fiber.Handler {
 // MiddlewareWithConfig returns a Fiber middleware with custom config.
 func MiddlewareWithConfig(config Config) fiber.Handler {
 	arcisConfig := arcis.Config{
-		Sanitize:          config.Sanitize,
-		SanitizeXSS:       config.SanitizeXSS,
-		SanitizeSQL:       config.SanitizeSQL,
-		SanitizeNoSQL:     config.SanitizeNoSQL,
-		SanitizePath:      config.SanitizePath,
-		SanitizeCmd:       config.SanitizeCmd,
-		MaxInputSize:      config.MaxInputSize,
-		RateLimit:         config.RateLimit,
-		RateLimitMax:      config.RateLimitMax,
-		RateLimitWindow:   config.RateLimitWindow,
-		Headers:           config.Headers,
-		CSP:               config.CSP,
-		FrameOptions:      config.FrameOptions,
-		HSTSMaxAge:        config.HSTSMaxAge,
-		HSTSSubdomains:    config.HSTSSubdomains,
-		ReferrerPolicy:    config.ReferrerPolicy,
-		PermissionsPolicy: config.PermissionsPolicy,
-		CacheControl:      config.CacheControl,
-		CacheControlValue: config.CacheControlValue,
-		IsDev:             config.IsDev,
+		Sanitize:        config.Sanitize,
+		SanitizeXSS:     config.SanitizeXSS,
+		SanitizeSQL:     config.SanitizeSQL,
+		SanitizeNoSQL:   config.SanitizeNoSQL,
+		SanitizePath:    config.SanitizePath,
+		SanitizeCmd:     config.SanitizeCmd,
+		MaxInputSize:    config.MaxInputSize,
+		RateLimit:       config.RateLimit,
+		RateLimitMax:    config.RateLimitMax,
+		RateLimitWindow: config.RateLimitWindow,
+		IsDev:           config.IsDev,
+	}
+
+	// Compile headers first: invalid configuration panics before any
+	// background goroutine starts.
+	var securityHeaders *arcis.SecurityHeaders
+	if config.Headers {
+		securityHeaders = compileSecurityHeaders(config)
 	}
 
 	sanitizer := arcis.NewSanitizer(arcisConfig)
@@ -380,11 +468,6 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 			rateLimiter = arcis.NewRateLimiter(config.RateLimitMax, config.RateLimitWindow)
 		}
 		instance.rateLimiter = rateLimiter
-	}
-
-	var securityHeaders *arcis.SecurityHeaders
-	if config.Headers {
-		securityHeaders = arcis.NewSecurityHeaders(arcisConfig)
 	}
 
 	registerInstance(instance)
@@ -412,15 +495,12 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 	}
 
 	return func(c *fiber.Ctx) (returnedErr error) {
+		defer stripFingerprintHeaders(c, securityHeaders)
 		if securityHeaders != nil {
-			for key, value := range securityHeaders.GetHeaders() {
-				c.Set(key, value)
+			if err := applySecurityHeaders(c, securityHeaders); err != nil {
+				return err
 			}
 		}
-		defer func() {
-			c.Response().Header.Del("Server")
-			c.Response().Header.Del("X-Powered-By")
-		}()
 		start := time.Now()
 		var (
 			decision    = telemetry.DecisionAllow
