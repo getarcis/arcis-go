@@ -123,11 +123,11 @@ func TestChiTelemetry_AllowPath(t *testing.T) {
 	if evt.Method != http.MethodGet {
 		t.Errorf("Method = %q, want GET", evt.Method)
 	}
-	if evt.Path != "/ok" {
-		t.Errorf("Path = %q, want /ok", evt.Path)
+	if evt.Path != "[redacted]" {
+		t.Errorf("Path = %q, want [redacted]", evt.Path)
 	}
-	if evt.UserAgent != "test-ua-allow" {
-		t.Errorf("UserAgent = %q, want test-ua-allow", evt.UserAgent)
+	if evt.UserAgent != "" {
+		t.Errorf("UserAgent must be omitted, got %q", evt.UserAgent)
 	}
 	if evt.LatencyMs < 0 {
 		t.Errorf("LatencyMs = %v, want >= 0", evt.LatencyMs)
@@ -189,17 +189,17 @@ func TestChiTelemetry_BlockDenyPath(t *testing.T) {
 	if evt.Severity != telemetry.SeverityHigh {
 		t.Errorf("Severity = %q, want high", evt.Severity)
 	}
-	if evt.MatchedPattern == "" {
-		t.Errorf("MatchedPattern is empty, want a sample of the attack string")
+	if evt.MatchedPattern != "" {
+		t.Errorf("MatchedPattern must be omitted, got %q", evt.MatchedPattern)
 	}
-	if evt.Reason != "Detected xss pattern" {
-		t.Errorf("Reason = %q, want Detected xss pattern", evt.Reason)
+	if evt.Reason != "" {
+		t.Errorf("Reason must be omitted, got %q", evt.Reason)
 	}
 	if evt.Status != http.StatusForbidden {
 		t.Errorf("Status = %d, want 403", evt.Status)
 	}
-	if evt.Path != "/api" {
-		t.Errorf("Path = %q, want /api", evt.Path)
+	if evt.Path != "[redacted]" {
+		t.Errorf("Path = %q, want [redacted]", evt.Path)
 	}
 }
 
@@ -324,7 +324,7 @@ func TestChiTelemetry_StandaloneRateLimitDeny(t *testing.T) {
 	if evt.Status != http.StatusTooManyRequests {
 		t.Errorf("Status = %d, want 429", evt.Status)
 	}
-	if evt.Reason != "Rate limit exceeded" {
-		t.Errorf("Reason = %q, want Rate limit exceeded", evt.Reason)
+	if evt.Reason != "" {
+		t.Errorf("Reason must be omitted, got %q", evt.Reason)
 	}
 }

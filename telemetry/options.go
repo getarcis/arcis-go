@@ -29,6 +29,10 @@ type Options struct {
 	// WorkspaceID, if set, is sent as the "X-Workspace-Id" header.
 	WorkspaceID string
 
+	// Static application labels. Never derive these from request values.
+	RouteID  string
+	PolicyID string
+
 	// BatchSize triggers a flush when the queue reaches this length.
 	// Clamped to [1, MaxBatchSize]. Zero/unset = DefaultBatchSize.
 	BatchSize int

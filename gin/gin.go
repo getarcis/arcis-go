@@ -177,6 +177,23 @@ type Config struct {
 	CacheControl      bool
 	CacheControlValue string // Custom Cache-Control value. Empty = use secure default.
 
+	// Cross-origin isolation headers (legacy profile), as in arcis.Config.
+	CrossOriginOpenerPolicy   string
+	CrossOriginResourcePolicy string
+	CrossOriginEmbedderPolicy string
+	OriginAgentCluster        bool
+	DNSPrefetchControl        bool
+
+	// HeaderProfile selects the header defaults: empty or
+	// arcis.HeaderProfileLegacy uses the fields above;
+	// arcis.HeaderProfileBaseline uses BaselineHeaders (Helmet 8
+	// compatible). An invalid baseline configuration makes
+	// MiddlewareWithConfig and HeadersWithConfig panic. With
+	// BaselineHeaders.ContentSecurityPolicy.Nonce, handlers read the nonce
+	// with arcis.CSPNonce(c.Request.Context()).
+	HeaderProfile   arcis.HeaderProfile
+	BaselineHeaders arcis.BaselineHeaderOptions
+
 	// Error handler options
 	IsDev bool
 
@@ -237,8 +254,55 @@ func DefaultConfig() Config {
 		ReferrerPolicy:    "strict-origin-when-cross-origin",
 		PermissionsPolicy: "geolocation=(), microphone=(), camera=()",
 		CacheControl:      true,
-		IsDev:             false,
+
+		CrossOriginOpenerPolicy:   "same-origin",
+		CrossOriginResourcePolicy: "same-origin",
+		CrossOriginEmbedderPolicy: "require-corp",
+		OriginAgentCluster:        true,
+		DNSPrefetchControl:        true,
+
+		IsDev: false,
 	}
+}
+
+// compileSecurityHeaders compiles the header settings in config. It
+// panics on an unknown HeaderProfile or invalid BaselineHeaders, so the
+// mistake surfaces when the middleware is built rather than per request.
+func compileSecurityHeaders(config Config) *arcis.SecurityHeaders {
+	headers, err := arcis.CompileSecurityHeaders(arcis.Config{
+		CSP:                       config.CSP,
+		FrameOptions:              config.FrameOptions,
+		HSTSMaxAge:                config.HSTSMaxAge,
+		HSTSSubdomains:            config.HSTSSubdomains,
+		ReferrerPolicy:            config.ReferrerPolicy,
+		PermissionsPolicy:         config.PermissionsPolicy,
+		CacheControl:              config.CacheControl,
+		CacheControlValue:         config.CacheControlValue,
+		CrossOriginOpenerPolicy:   config.CrossOriginOpenerPolicy,
+		CrossOriginResourcePolicy: config.CrossOriginResourcePolicy,
+		CrossOriginEmbedderPolicy: config.CrossOriginEmbedderPolicy,
+		OriginAgentCluster:        config.OriginAgentCluster,
+		DNSPrefetchControl:        config.DNSPrefetchControl,
+		HeaderProfile:             config.HeaderProfile,
+		BaselineHeaders:           config.BaselineHeaders,
+	})
+	if err != nil {
+		panic("arcis gin adapter: invalid security header configuration: " + err.Error())
+	}
+	return headers
+}
+
+// applySecurityHeaders sets the security headers before the handler runs,
+// so a header the route sets itself wins. It reports false after failing
+// the request when a CSP function value returned an invalid entry.
+func applySecurityHeaders(c *gin.Context, headers *arcis.SecurityHeaders) bool {
+	req, err := headers.Apply(c.Writer.Header(), c.Request)
+	if err != nil {
+		_ = c.AbortWithError(http.StatusInternalServerError, err)
+		return false
+	}
+	c.Request = req
+	return true
 }
 
 // arcisInstance holds the Arcis components for cleanup.
@@ -358,26 +422,24 @@ func Middleware() gin.HandlerFunc {
 func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 	// Convert to core Arcis config
 	arcisConfig := arcis.Config{
-		Sanitize:          config.Sanitize,
-		SanitizeXSS:       config.SanitizeXSS,
-		SanitizeSQL:       config.SanitizeSQL,
-		SanitizeNoSQL:     config.SanitizeNoSQL,
-		SanitizePath:      config.SanitizePath,
-		SanitizeCmd:       config.SanitizeCmd,
-		MaxInputSize:      config.MaxInputSize,
-		RateLimit:         config.RateLimit,
-		RateLimitMax:      config.RateLimitMax,
-		RateLimitWindow:   config.RateLimitWindow,
-		Headers:           config.Headers,
-		CSP:               config.CSP,
-		FrameOptions:      config.FrameOptions,
-		HSTSMaxAge:        config.HSTSMaxAge,
-		HSTSSubdomains:    config.HSTSSubdomains,
-		ReferrerPolicy:    config.ReferrerPolicy,
-		PermissionsPolicy: config.PermissionsPolicy,
-		CacheControl:      config.CacheControl,
-		CacheControlValue: config.CacheControlValue,
-		IsDev:             config.IsDev,
+		Sanitize:        config.Sanitize,
+		SanitizeXSS:     config.SanitizeXSS,
+		SanitizeSQL:     config.SanitizeSQL,
+		SanitizeNoSQL:   config.SanitizeNoSQL,
+		SanitizePath:    config.SanitizePath,
+		SanitizeCmd:     config.SanitizeCmd,
+		MaxInputSize:    config.MaxInputSize,
+		RateLimit:       config.RateLimit,
+		RateLimitMax:    config.RateLimitMax,
+		RateLimitWindow: config.RateLimitWindow,
+		IsDev:           config.IsDev,
+	}
+
+	// Compile headers first: invalid configuration panics before any
+	// background goroutine starts.
+	var securityHeaders *arcis.SecurityHeaders
+	if config.Headers {
+		securityHeaders = compileSecurityHeaders(config)
 	}
 
 	sanitizer := arcis.NewSanitizer(arcisConfig)
@@ -391,11 +453,6 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 			rateLimiter = arcis.NewRateLimiter(config.RateLimitMax, config.RateLimitWindow)
 		}
 		instance.rateLimiter = rateLimiter
-	}
-
-	var securityHeaders *arcis.SecurityHeaders
-	if config.Headers {
-		securityHeaders = arcis.NewSecurityHeaders(arcisConfig)
 	}
 
 	registerInstance(instance)
@@ -423,13 +480,11 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 	}
 
 	return func(c *gin.Context) {
-		writer := &fingerprintWriter{ResponseWriter: c.Writer}
+		writer := &fingerprintWriter{ResponseWriter: c.Writer, keepPoweredBy: securityHeaders != nil && !securityHeaders.RemovesPoweredBy()}
 		c.Writer = writer
 		defer writer.strip() // Also covers responses committed by Gin after return.
-		if securityHeaders != nil {
-			for key, value := range securityHeaders.GetHeaders() {
-				c.Header(key, value)
-			}
+		if securityHeaders != nil && !applySecurityHeaders(c, securityHeaders) {
+			return
 		}
 		start := time.Now()
 		// Per-request telemetry locals. Deny branches mutate these before
@@ -443,10 +498,14 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 			evtReason   string
 			evtSeverity telemetry.Severity
 		)
+		applicationPending := false
 		if config.Telemetry != nil {
 			defer func() {
 				status := c.Writer.Status()
-				if status == 0 {
+				if applicationPending && !c.Writer.Written() {
+					// An outer recovery handler still owns the response.
+					status = 0
+				} else if status == 0 {
 					status = http.StatusOK
 				}
 				latency := float64(time.Since(start)) / float64(time.Millisecond)
@@ -549,9 +608,9 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 					decision = telemetry.DecisionDeny
 				}
 				evtVector = "scanner-path"
-				evtRule = "scanner-path/probe"
+				evtRule = "scanner-path/sensitive"
 				evtMatched = matched
-				evtSeverity = telemetry.SeverityHigh
+				evtSeverity = telemetry.SeverityMedium
 				evtReason = "Scanner probe path"
 				if !config.DryRun {
 					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
@@ -787,7 +846,9 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 		// Store sanitizer in context for use in handlers
 		c.Set("arcis_sanitizer", sanitizer)
 
+		applicationPending = true
 		c.Next()
+		applicationPending = false
 
 	}
 }
@@ -798,26 +859,16 @@ func Headers() gin.HandlerFunc {
 }
 
 // HeadersWithConfig returns a headers middleware with custom configuration.
+// It panics on an invalid header configuration (see Config.HeaderProfile).
 func HeadersWithConfig(config Config) gin.HandlerFunc {
-	arcisConfig := arcis.Config{
-		CSP:               config.CSP,
-		FrameOptions:      config.FrameOptions,
-		HSTSMaxAge:        config.HSTSMaxAge,
-		HSTSSubdomains:    config.HSTSSubdomains,
-		ReferrerPolicy:    config.ReferrerPolicy,
-		PermissionsPolicy: config.PermissionsPolicy,
-		CacheControl:      config.CacheControl,
-		CacheControlValue: config.CacheControlValue,
-	}
-
-	headers := arcis.NewSecurityHeaders(arcisConfig)
+	headers := compileSecurityHeaders(config)
 
 	return func(c *gin.Context) {
-		writer := &fingerprintWriter{ResponseWriter: c.Writer}
+		writer := &fingerprintWriter{ResponseWriter: c.Writer, keepPoweredBy: !headers.RemovesPoweredBy()}
 		c.Writer = writer
 		defer writer.strip()
-		for key, value := range headers.GetHeaders() {
-			c.Header(key, value)
+		if !applySecurityHeaders(c, headers) {
+			return
 		}
 		c.Next()
 	}

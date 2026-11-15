@@ -53,6 +53,13 @@ type Config struct {
 	OriginAgentCluster        bool   // Send Origin-Agent-Cluster: ?1 (default: true)
 	DNSPrefetchControl        bool   // Send X-DNS-Prefetch-Control: off (default: true)
 
+	// HeaderProfile selects the header defaults. Empty or
+	// HeaderProfileLegacy uses the fields above; HeaderProfileBaseline
+	// uses BaselineHeaders (Helmet 8 compatible) and ignores them.
+	HeaderProfile HeaderProfile
+	// BaselineHeaders configures the baseline profile.
+	BaselineHeaders BaselineHeaderOptions
+
 	// Error handler options
 	IsDev bool // Show error details in development mode
 }

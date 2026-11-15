@@ -10,11 +10,17 @@ import (
 // Embedding preserves Gin's status, size, hijacking, and push interfaces.
 type fingerprintWriter struct {
 	gin.ResponseWriter
+
+	// keepPoweredBy leaves X-Powered-By alone (baseline profile with
+	// X-Powered-By disabled).
+	keepPoweredBy bool
 }
 
 func (w *fingerprintWriter) strip() {
 	w.Header().Del("Server")
-	w.Header().Del("X-Powered-By")
+	if !w.keepPoweredBy {
+		w.Header().Del("X-Powered-By")
+	}
 }
 
 func (w *fingerprintWriter) WriteHeader(code int) {

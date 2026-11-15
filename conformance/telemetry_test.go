@@ -57,7 +57,7 @@ func TestRealServerConcurrentLimiterAndTelemetry(t *testing.T) {
 			}
 			eventAllowed, eventDenied := 0, 0
 			for _, event := range awaitTelemetry(t, received, requests) {
-				if event.Method != "POST" || event.Path != "/echo" || event.IP == "" {
+				if event.Method != "POST" || event.Path != "[redacted]" || event.IP == "" {
 					t.Errorf("invalid request event: %+v", event)
 				}
 				switch {
