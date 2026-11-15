@@ -102,13 +102,14 @@ func mustNotReceive(t *testing.T, ch <-chan capturedRequest, window time.Duratio
 	}
 }
 
-// sampleEvent returns a minimal event whose Path doubles as a probe ID.
+// sampleEvent returns a minimal event whose Rule doubles as a probe ID.
 func sampleEvent(id string) Event {
 	return Event{
 		Ts:        "2026-05-06T00:00:00Z",
 		IP:        "1.2.3.4",
 		Method:    "GET",
 		Path:      "/" + id,
+		Rule:      "/" + id,
 		Decision:  DecisionDeny,
 		Status:    403,
 		LatencyMs: 0,
@@ -127,7 +128,7 @@ func decodeBatch(t *testing.T, body []byte) []Event {
 func paths(events []Event) []string {
 	out := make([]string, len(events))
 	for i, e := range events {
-		out[i] = e.Path
+		out[i] = e.Rule
 	}
 	return out
 }

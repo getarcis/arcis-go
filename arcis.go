@@ -71,6 +71,7 @@ Usage with Echo:
 package arcis
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -93,6 +94,23 @@ type RateLimitResult = core.RateLimitResult
 type RateLimitEntry = core.RateLimitEntry
 type RateLimitStore = core.RateLimitStore
 type InputTooLargeError = core.InputTooLargeError
+
+// Security header profile types. See core.BaselineHeaderOptions.
+type HeaderProfile = core.HeaderProfile
+type BaselineHeaderOptions = core.BaselineHeaderOptions
+type CSPOptions = core.CSPOptions
+type CSPDirective = core.CSPDirective
+type HSTSOptions = core.HSTSOptions
+type PermissionsPolicyFeature = core.PermissionsPolicyFeature
+type ReportingEndpoint = core.ReportingEndpoint
+
+// Header profiles for Config.HeaderProfile.
+const (
+	// HeaderProfileLegacy is the historical Arcis header set (the default).
+	HeaderProfileLegacy = core.HeaderProfileLegacy
+	// HeaderProfileBaseline matches Helmet 8.3.0 plus Arcis extensions.
+	HeaderProfileBaseline = core.HeaderProfileBaseline
+)
 
 // Sanitizer types
 type Sanitizer = sanitizers.Sanitizer
@@ -270,8 +288,27 @@ var NewRateLimiter = middleware.NewRateLimiter
 // NewRateLimiterWithStore creates a new RateLimiter backed by the provided store.
 var NewRateLimiterWithStore = middleware.NewRateLimiterWithStore
 
-// NewSecurityHeaders creates a new SecurityHeaders with the given configuration.
+// NewSecurityHeaders creates a new SecurityHeaders with the given
+// configuration. It always builds the legacy profile; use
+// CompileSecurityHeaders to honor Config.HeaderProfile.
 var NewSecurityHeaders = middleware.NewSecurityHeaders
+
+// CompileSecurityHeaders builds the header set selected by
+// Config.HeaderProfile, returning an error for invalid configuration.
+var CompileSecurityHeaders = middleware.CompileSecurityHeaders
+
+// NewBaselineSecurityHeaders validates opts and returns the baseline
+// (Helmet 8 compatible) header set.
+var NewBaselineSecurityHeaders = middleware.NewBaselineSecurityHeaders
+
+// CSPNonce returns the Content-Security-Policy nonce generated for this
+// request by the baseline profile with CSPOptions.Nonce, or "" when there
+// is none. Pass the request context: r.Context() (net/http, chi),
+// c.Request.Context() (Gin), c.Request().Context() (Echo) or
+// c.UserContext() (Fiber).
+func CSPNonce(ctx context.Context) string {
+	return middleware.CSPNonce(ctx)
+}
 
 // NewErrorHandler creates a new ErrorHandler.
 var NewErrorHandler = middleware.NewErrorHandler
@@ -807,8 +844,21 @@ func New() *Arcis {
 }
 
 // NewWithConfig creates a new Arcis instance with custom configuration.
+// It panics if config.HeaderProfile is unknown or the baseline header
+// options are invalid, so the mistake surfaces at startup; use
+// CompileSecurityHeaders to validate them as an error instead.
 func NewWithConfig(config Config) *Arcis {
 	s := &Arcis{config: config}
+
+	// Compile headers first: invalid configuration panics before the rate
+	// limiter starts its background goroutine.
+	if config.Headers {
+		headers, err := CompileSecurityHeaders(config)
+		if err != nil {
+			panic("arcis: invalid security header configuration: " + err.Error())
+		}
+		s.headers = headers
+	}
 
 	if config.Sanitize {
 		s.sanitizer = NewSanitizer(config)
@@ -823,10 +873,6 @@ func NewWithConfig(config Config) *Arcis {
 		if config.RateLimitSkip != nil {
 			s.rateLimiter.SetSkipFunc(config.RateLimitSkip)
 		}
-	}
-
-	if config.Headers {
-		s.headers = NewSecurityHeaders(config)
 	}
 
 	s.errorHandler = NewErrorHandler(config.IsDev)
@@ -862,16 +908,21 @@ func (s *Arcis) Handler(next http.Handler) http.Handler {
 			}
 		}
 
-		// Security headers
+		// Security headers, set before the handler so a header the route
+		// sets itself wins.
 		if s.headers != nil {
-			for key, value := range s.headers.GetHeaders() {
-				w.Header().Set(key, value)
+			var err error
+			if r, err = s.headers.Apply(w.Header(), r); err != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
 			}
 		}
 
 		// Remove fingerprinting headers
 		w.Header().Del("Server")
-		w.Header().Del("X-Powered-By")
+		if s.headers == nil || s.headers.RemovesPoweredBy() {
+			w.Header().Del("X-Powered-By")
+		}
 
 		next.ServeHTTP(w, r)
 	})

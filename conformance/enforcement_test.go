@@ -123,9 +123,14 @@ func TestRealServerBotAllowDenyAndRecovery(t *testing.T) {
 }
 
 type enforcementOptions struct {
-	limit     int
-	dryRun    bool
-	telemetry *telemetry.Client
+	limit               int
+	dryRun              bool
+	telemetry           *telemetry.Client
+	applicationStatus   int
+	disableRateLimit    bool
+	panicBeforeResponse bool
+	applicationPath     string
+	trustedHosts        []string
 }
 
 func TestRealServerEnforcingPreservesMalformedAndNonJSON(t *testing.T) {
@@ -173,6 +178,12 @@ func startEnforcementServer(t *testing.T, adapter string, options ...enforcement
 	if opts.limit == 0 {
 		opts.limit = 100
 	}
+	if opts.applicationStatus == 0 {
+		opts.applicationStatus = http.StatusOK
+	}
+	if opts.applicationPath == "" {
+		opts.applicationPath = "/echo"
+	}
 	var handler http.Handler
 	switch adapter {
 	case "gin":
@@ -180,18 +191,23 @@ func startEnforcementServer(t *testing.T, adapter string, options ...enforcement
 		cfg := arcisgin.DefaultConfig()
 		cfg.Block = true
 		cfg.RateLimitMax = opts.limit
+		cfg.RateLimit = !opts.disableRateLimit
 		cfg.DryRun = opts.dryRun
 		cfg.Telemetry = opts.telemetry
+		cfg.TrustedHosts = opts.trustedHosts
 		router := gin.New()
 		router.Use(arcisgin.MiddlewareWithConfig(cfg))
-		router.POST("/echo", func(c *gin.Context) {
+		router.POST(opts.applicationPath, func(c *gin.Context) {
+			if opts.panicBeforeResponse {
+				panic("application failure")
+			}
 			raw, err := io.ReadAll(c.Request.Body)
 			if err != nil {
 				c.Status(http.StatusInternalServerError)
 				return
 			}
 			c.Header("X-Application-Reached", "yes")
-			c.Data(http.StatusOK, "application/json", raw)
+			c.Data(opts.applicationStatus, "application/json", raw)
 		})
 		t.Cleanup(arcisgin.Cleanup)
 		handler = router
@@ -200,16 +216,21 @@ func startEnforcementServer(t *testing.T, adapter string, options ...enforcement
 		cfg.Block = true
 		cfg.RateLimitMax = opts.limit
 		cfg.DryRun = opts.dryRun
+		cfg.RateLimit = !opts.disableRateLimit
 		cfg.Telemetry = opts.telemetry
+		cfg.TrustedHosts = opts.trustedHosts
 		app := echo.New()
 		app.Use(arcisecho.MiddlewareWithConfig(cfg))
-		app.POST("/echo", func(c echo.Context) error {
+		app.POST(opts.applicationPath, func(c echo.Context) error {
+			if opts.panicBeforeResponse {
+				panic("application failure")
+			}
 			raw, err := io.ReadAll(c.Request().Body)
 			if err != nil {
 				return err
 			}
 			c.Response().Header().Set("X-Application-Reached", "yes")
-			return c.Blob(http.StatusOK, "application/json", raw)
+			return c.Blob(opts.applicationStatus, "application/json", raw)
 		})
 		t.Cleanup(arcisecho.Cleanup)
 		handler = app
@@ -217,47 +238,94 @@ func startEnforcementServer(t *testing.T, adapter string, options ...enforcement
 		cfg := arcischi.DefaultConfig()
 		cfg.Block = true
 		cfg.RateLimitMax = opts.limit
+		cfg.RateLimit = !opts.disableRateLimit
 		cfg.DryRun = opts.dryRun
 		cfg.Telemetry = opts.telemetry
+		cfg.TrustedHosts = opts.trustedHosts
 		router := gochi.NewRouter()
 		router.Use(arcischi.MiddlewareWithConfig(cfg))
-		router.Post("/echo", echoRawBody)
+		router.Post(opts.applicationPath, func(w http.ResponseWriter, r *http.Request) {
+			if opts.panicBeforeResponse {
+				panic("application failure")
+			}
+			echoRawBody(w, r, opts.applicationStatus)
+		})
 		t.Cleanup(arcischi.Cleanup)
 		handler = router
 	case "nethttp":
 		cfg := archttp.DefaultConfig()
 		cfg.Block = true
 		cfg.RateLimitMax = opts.limit
+		cfg.RateLimit = !opts.disableRateLimit
 		cfg.DryRun = opts.dryRun
 		cfg.Telemetry = opts.telemetry
+		cfg.TrustedHosts = opts.trustedHosts
 		mux := http.NewServeMux()
-		mux.HandleFunc("POST /echo", echoRawBody)
+		mux.HandleFunc("POST "+opts.applicationPath, func(w http.ResponseWriter, r *http.Request) {
+			if opts.panicBeforeResponse {
+				panic("application failure")
+			}
+			echoRawBody(w, r, opts.applicationStatus)
+		})
 		handler = archttp.MiddlewareWithConfig(cfg)(mux)
 		t.Cleanup(archttp.Cleanup)
 	case "fiber":
 		cfg := arcisfiber.DefaultConfig()
 		cfg.Block = true
 		cfg.RateLimitMax = opts.limit
+		cfg.RateLimit = !opts.disableRateLimit
 		cfg.DryRun = opts.dryRun
 		cfg.Telemetry = opts.telemetry
+		cfg.TrustedHosts = opts.trustedHosts
 		app := fiber.New(fiber.Config{DisableStartupMessage: true})
+		if opts.panicBeforeResponse {
+			app.Use(func(c *fiber.Ctx) (err error) {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						if recovered == "application failure" {
+							c.Set("X-Error-Propagated", "yes")
+						}
+						err = c.Status(opts.applicationStatus).SendString("application failure")
+					}
+				}()
+				return c.Next()
+			})
+		}
 		app.Use(arcisfiber.MiddlewareWithConfig(cfg))
-		app.Post("/echo", func(c *fiber.Ctx) error {
+		app.Post(opts.applicationPath, func(c *fiber.Ctx) error {
+			if opts.panicBeforeResponse {
+				panic("application failure")
+			}
 			c.Set("X-Application-Reached", "yes")
 			c.Set("Content-Type", "application/json")
-			return c.Send(append([]byte(nil), c.Body()...))
+			return c.Status(opts.applicationStatus).Send(append([]byte(nil), c.Body()...))
 		})
 		t.Cleanup(arcisfiber.Cleanup)
 		return startFiberRealServer(t, app)
 	default:
 		t.Fatalf("unknown adapter %q", adapter)
 	}
+	if opts.panicBeforeResponse {
+		inner := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					if recovered == "application failure" {
+						w.Header().Set("X-Error-Propagated", "yes")
+					}
+					w.WriteHeader(opts.applicationStatus)
+					_, _ = w.Write([]byte("application failure"))
+				}
+			}()
+			inner.ServeHTTP(w, r)
+		})
+	}
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	return server.URL
 }
 
-func echoRawBody(w http.ResponseWriter, r *http.Request) {
+func echoRawBody(w http.ResponseWriter, r *http.Request, status int) {
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -265,5 +333,6 @@ func echoRawBody(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-Application-Reached", "yes")
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_, _ = w.Write(raw)
 }
