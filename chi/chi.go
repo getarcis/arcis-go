@@ -486,10 +486,14 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 				evtReason   string
 				evtSeverity telemetry.Severity
 			)
+			applicationPending := false
 			if config.Telemetry != nil {
 				defer func() {
 					status := sw.status
-					if status == 0 {
+					if applicationPending && !sw.wroteHeader {
+						// An outer recovery handler still owns the response.
+						status = 0
+					} else if status == 0 {
 						status = http.StatusOK
 					}
 					latency := float64(time.Since(start)) / float64(time.Millisecond)
@@ -587,9 +591,9 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 						decision = telemetry.DecisionDeny
 					}
 					evtVector = "scanner-path"
-					evtRule = "scanner-path/probe"
+					evtRule = "scanner-path/sensitive"
 					evtMatched = matched
-					evtSeverity = telemetry.SeverityHigh
+					evtSeverity = telemetry.SeverityMedium
 					evtReason = "Scanner probe path"
 					if !config.DryRun {
 						sw.Header().Set("Content-Type", "application/json")
@@ -798,7 +802,9 @@ func MiddlewareWithConfig(config Config) func(http.Handler) http.Handler {
 			// via GetSanitizer(r). Stdlib equivalent of gin's c.Set / echo's
 			// c.Set.
 			ctx := context.WithValue(r.Context(), sanitizerCtxKey, sanitizer)
+			applicationPending = true
 			next.ServeHTTP(sw, r.WithContext(ctx))
+			applicationPending = false
 
 		})
 	}

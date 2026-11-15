@@ -42,4 +42,8 @@ type Event struct {
 	Status         int      `json:"status"`
 	MatchedPattern string   `json:"matchedPattern,omitempty"`
 	LatencyMs      float64  `json:"latencyMs"`
+	SchemaVersion  string   `json:"schemaVersion,omitempty"`
+	SDK            string   `json:"sdk,omitempty"`
+	RouteID        string   `json:"routeId,omitempty"`
+	PolicyID       string   `json:"policyId,omitempty"`
 }

@@ -443,10 +443,14 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 			evtReason   string
 			evtSeverity telemetry.Severity
 		)
+		applicationPending := false
 		if config.Telemetry != nil {
 			defer func() {
 				status := c.Writer.Status()
-				if status == 0 {
+				if applicationPending && !c.Writer.Written() {
+					// An outer recovery handler still owns the response.
+					status = 0
+				} else if status == 0 {
 					status = http.StatusOK
 				}
 				latency := float64(time.Since(start)) / float64(time.Millisecond)
@@ -549,9 +553,9 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 					decision = telemetry.DecisionDeny
 				}
 				evtVector = "scanner-path"
-				evtRule = "scanner-path/probe"
+				evtRule = "scanner-path/sensitive"
 				evtMatched = matched
-				evtSeverity = telemetry.SeverityHigh
+				evtSeverity = telemetry.SeverityMedium
 				evtReason = "Scanner probe path"
 				if !config.DryRun {
 					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
@@ -787,7 +791,9 @@ func MiddlewareWithConfig(config Config) gin.HandlerFunc {
 		// Store sanitizer in context for use in handlers
 		c.Set("arcis_sanitizer", sanitizer)
 
+		applicationPending = true
 		c.Next()
+		applicationPending = false
 
 	}
 }

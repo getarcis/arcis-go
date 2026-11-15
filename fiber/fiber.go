@@ -411,7 +411,7 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 		}()
 	}
 
-	return func(c *fiber.Ctx) error {
+	return func(c *fiber.Ctx) (returnedErr error) {
 		if securityHeaders != nil {
 			for key, value := range securityHeaders.GetHeaders() {
 				c.Set(key, value)
@@ -430,8 +430,15 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 			evtReason   string
 			evtSeverity telemetry.Severity
 		)
+		applicationPending := false
 		if config.Telemetry != nil {
 			defer func() {
+				status := c.Response().StatusCode()
+				if returnedErr != nil || applicationPending {
+					// Fiber finalizes returned errors outside this middleware.
+					// Its buffered response may still be replaced by the app.
+					status = 0
+				}
 				latency := float64(time.Since(start)) / float64(time.Millisecond)
 				if latency < 0 {
 					latency = 0
@@ -448,7 +455,7 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 					Reason:         evtReason,
 					Severity:       evtSeverity,
 					UserAgent:      c.Get(fiber.HeaderUserAgent),
-					Status:         c.Response().StatusCode(),
+					Status:         status,
 					LatencyMs:      latency,
 				})
 			}()
@@ -532,9 +539,9 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 					decision = telemetry.DecisionDeny
 				}
 				evtVector = "scanner-path"
-				evtRule = "scanner-path/probe"
+				evtRule = "scanner-path/sensitive"
 				evtMatched = matched
-				evtSeverity = telemetry.SeverityHigh
+				evtSeverity = telemetry.SeverityMedium
 				evtReason = "Scanner probe path"
 				if !config.DryRun {
 					return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
@@ -768,11 +775,11 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 		// via GetSanitizer(c).
 		c.Locals(sanitizerLocalKey, sanitizer)
 
-		if err := c.Next(); err != nil {
-			return err
-		}
+		applicationPending = true
+		err := c.Next()
+		applicationPending = false
 
-		return nil
+		return err
 	}
 }
 

@@ -2,9 +2,9 @@ name: test
 
 on:
   push:
-    branches: [main]
+    branches: [main, nwl]
   pull_request:
-    branches: [main]
+    branches: [main, nwl]
   workflow_dispatch: {}
 
 jobs:
@@ -93,8 +93,8 @@ jobs:
     # Guards against arcis-go's vendored shared data drifting from the
     # monorepo's authoritative copies. arcis-go lives in a separate repo, so
     # the monorepo's own data-sync-check can't reach it -- this is the
-    # cross-repo half. Three files must stay byte-identical to
-    # getarcis/arcis main:
+    # cross-repo half. Three files must stay byte-identical to the same
+    # branch of getarcis/arcis (main for releases, nwl for integration work):
     #   spec/TEST_VECTORS.json            <- spec/TEST_VECTORS.json
     #   sanitizers/data/patterns.json     <- packages/core/patterns.json
     #   middleware/data/bot_patterns.json <- packages/core/bot-patterns.json
@@ -104,14 +104,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compare shared data files against getarcis/arcis main
+      - name: Compare shared data files against the matching getarcis/arcis branch
+        env:
+          UPSTREAM_BRANCH: ${{ github.base_ref || github.ref_name }}
         run: |
-          base="https://raw.githubusercontent.com/getarcis/arcis/main"
+          case "$UPSTREAM_BRANCH" in
+            main|nwl) ;;
+            *) UPSTREAM_BRANCH=main ;;
+          esac
+          base="https://raw.githubusercontent.com/getarcis/arcis/$UPSTREAM_BRANCH"
+          echo "Comparing against getarcis/arcis $UPSTREAM_BRANCH"
           rc=0
           check() {
             local local_path="$1" upstream_path="$2"
             if ! curl -fsSL "$base/$upstream_path" -o /tmp/upstream.json; then
-              echo "::error::could not fetch $upstream_path from getarcis/arcis main"
+              echo "::error::could not fetch $upstream_path from getarcis/arcis $UPSTREAM_BRANCH"
               rc=1
               return
             fi
@@ -122,7 +129,7 @@ jobs:
             echo "  local:    $local_sha"
             echo "  upstream: $upstream_sha"
             if [ "$local_sha" != "$upstream_sha" ]; then
-              echo "::error::$local_path has drifted from getarcis/arcis main ($upstream_path)."
+              echo "::error::$local_path has drifted from getarcis/arcis $UPSTREAM_BRANCH ($upstream_path)."
               echo "Run: cp ../arcis/$upstream_path $local_path"
               rc=1
             fi
