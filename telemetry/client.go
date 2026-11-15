@@ -20,9 +20,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -35,6 +37,8 @@ type Client struct {
 	endpoint    string
 	apiKey      string
 	workspaceID string
+	routeID     string
+	policyID    string
 	batchSize   int
 	flushEvery  time.Duration
 	maxQueue    int
@@ -66,11 +70,19 @@ type batchEnvelope struct {
 	Events []Event `json:"events"`
 }
 
+var metadataLabelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
 // NewClient validates Options, applies defaults, and starts the background
 // flush goroutine. Returns an error if Endpoint is empty.
 func NewClient(opts Options) (*Client, error) {
 	if opts.Endpoint == "" {
 		return nil, errors.New("telemetry: Endpoint is required")
+	}
+	if opts.RouteID != "" && !metadataLabelPattern.MatchString(opts.RouteID) {
+		return nil, errors.New("telemetry: invalid RouteID")
+	}
+	if opts.PolicyID != "" && !metadataLabelPattern.MatchString(opts.PolicyID) {
+		return nil, errors.New("telemetry: invalid PolicyID")
 	}
 
 	batchSize := opts.BatchSize
@@ -110,6 +122,8 @@ func NewClient(opts Options) (*Client, error) {
 		endpoint:    opts.Endpoint,
 		apiKey:      opts.APIKey,
 		workspaceID: opts.WorkspaceID,
+		routeID:     opts.RouteID,
+		policyID:    opts.PolicyID,
 		batchSize:   batchSize,
 		flushEvery:  flushEvery,
 		maxQueue:    maxQueue,
@@ -131,6 +145,19 @@ func NewClient(opts Options) (*Client, error) {
 // Send after Close is a silent no-op.
 func (c *Client) Send(evt Event) {
 	defer func() { _ = recover() }()
+
+	ip := evt.IP
+	if net.ParseIP(ip) == nil {
+		ip = "0.0.0.0"
+	}
+	// Keep only contract metadata; raw request evidence never enters the queue.
+	evt = Event{
+		Ts: evt.Ts, IP: ip, Method: evt.Method, Path: "[redacted]",
+		Decision: evt.Decision, Vector: evt.Vector, Rule: evt.Rule,
+		Severity: evt.Severity, Country: evt.Country,
+		Status: evt.Status, LatencyMs: evt.LatencyMs,
+		SchemaVersion: "1.1", SDK: "go", RouteID: c.routeID, PolicyID: c.policyID,
+	}
 
 	c.mu.Lock()
 	if c.closed {

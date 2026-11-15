@@ -416,7 +416,7 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 	}
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c echo.Context) (returnedErr error) {
 			c.Response().Before(func() {
 				c.Response().Header().Del("Server")
 				c.Response().Header().Del("X-Powered-By")
@@ -438,10 +438,15 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 				evtReason   string
 				evtSeverity telemetry.Severity
 			)
+			applicationPending := false
 			if config.Telemetry != nil {
 				defer func() {
 					status := c.Response().Status
-					if status == 0 {
+					if (returnedErr != nil || applicationPending) && !c.Response().Committed {
+						// The outer error handler has not finalized a response.
+						// Preserve its control flow and report unavailable.
+						status = 0
+					} else if status == 0 {
 						status = http.StatusOK
 					}
 					latency := float64(time.Since(start)) / float64(time.Millisecond)
@@ -539,9 +544,9 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 						decision = telemetry.DecisionDeny
 					}
 					evtVector = "scanner-path"
-					evtRule = "scanner-path/probe"
+					evtRule = "scanner-path/sensitive"
 					evtMatched = matched
-					evtSeverity = telemetry.SeverityHigh
+					evtSeverity = telemetry.SeverityMedium
 					evtReason = "Scanner probe path"
 					if !config.DryRun {
 						return c.JSON(http.StatusForbidden, map[string]string{
@@ -757,7 +762,9 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 			// Store sanitizer in context for use in handlers
 			c.Set(SanitizerKey, sanitizer)
 
+			applicationPending = true
 			err := next(c)
+			applicationPending = false
 
 			// Also clear the mutable map for handlers that defer their write.
 			c.Response().Header().Del("Server")
