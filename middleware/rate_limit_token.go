@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/getarcis/arcis-go/core"
+	"github.com/getarcis/arcis-go/internal/lru"
 	"github.com/getarcis/arcis-go/utils"
 )
 
@@ -15,16 +16,15 @@ import (
 // It allows bursts up to the bucket capacity, then refills tokens
 // at a steady rate. Good for APIs that need to allow short bursts.
 type TokenBucketLimiter struct {
-	capacity       int
-	refillRate     float64 // tokens per second
-	cost           int     // tokens consumed per request
-	buckets        map[string]*tokenBucket
-	mu             sync.Mutex
-	keyFunc        func(*http.Request) string
-	skipFunc       func(*http.Request) bool
-	staleThreshold float64 // seconds after which an idle bucket is cleaned up
-	ctx            context.Context
-	cancel         context.CancelFunc
+	capacity   int
+	refillRate float64 // tokens per second
+	cost       int     // tokens consumed per request
+	buckets    *lru.Map[*tokenBucket]
+	mu         sync.Mutex
+	keyFunc    func(*http.Request) string
+	skipFunc   func(*http.Request) bool
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 type tokenBucket struct {
@@ -58,14 +58,18 @@ func newTokenBucket(capacity int, refillRate float64, cost int) *TokenBucketLimi
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	staleThreshold := (float64(capacity) / refillRate) * 2
 	tb := &TokenBucketLimiter{
-		capacity:       capacity,
-		refillRate:     refillRate,
-		cost:           cost,
-		buckets:        make(map[string]*tokenBucket),
-		staleThreshold: (float64(capacity) / refillRate) * 2,
-		ctx:            ctx,
-		cancel:         cancel,
+		capacity:   capacity,
+		refillRate: refillRate,
+		cost:       cost,
+		// A bucket idle past staleThreshold has refilled completely, so
+		// dropping it loses nothing; at the cap the least recently used go.
+		buckets: lru.New(defaultMaxKeys, func(b *tokenBucket, now time.Time) bool {
+			return now.Sub(b.lastRefill).Seconds() > staleThreshold
+		}),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	// Cleanup goroutine every 60 seconds
@@ -95,7 +99,9 @@ func (tb *TokenBucketLimiter) SetSkipFunc(fn func(*http.Request) bool) {
 	tb.skipFunc = fn
 }
 
-// Check checks if a request is within the rate limit.
+// Check checks if a request is within the rate limit. The default key is
+// utils.RateLimitKey(utils.GetClientIP(r)); use SetKeyFunc with a
+// utils.ClientIPResolver for proxies outside the default trust set.
 func (tb *TokenBucketLimiter) Check(r *http.Request) core.RateLimitResult {
 	if tb.skipFunc != nil && tb.skipFunc(r) {
 		return core.RateLimitResult{
@@ -106,9 +112,11 @@ func (tb *TokenBucketLimiter) Check(r *http.Request) core.RateLimitResult {
 		}
 	}
 
-	key := utils.GetClientIP(r)
+	var key string
 	if tb.keyFunc != nil {
 		key = tb.keyFunc(r)
+	} else {
+		key = utils.RateLimitKey(utils.GetClientIP(r))
 	}
 
 	return tb.CheckKey(key)
@@ -121,13 +129,13 @@ func (tb *TokenBucketLimiter) CheckKey(key string) core.RateLimitResult {
 
 	now := time.Now()
 
-	bucket, exists := tb.buckets[key]
+	bucket, exists := tb.buckets.Get(key)
 	if !exists {
 		bucket = &tokenBucket{
 			tokens:     float64(tb.capacity),
 			lastRefill: now,
 		}
-		tb.buckets[key] = bucket
+		tb.buckets.Put(key, bucket, now)
 	}
 
 	// Refill tokens based on elapsed time
@@ -176,10 +184,5 @@ func (tb *TokenBucketLimiter) cleanup() {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	now := time.Now()
-	for key, bucket := range tb.buckets {
-		if now.Sub(bucket.lastRefill).Seconds() > tb.staleThreshold {
-			delete(tb.buckets, key)
-		}
-	}
+	tb.buckets.RemoveExpired(time.Now())
 }

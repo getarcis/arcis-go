@@ -82,6 +82,7 @@ import (
 	"github.com/getarcis/arcis-go/pipeline"
 	"github.com/getarcis/arcis-go/sanitizers"
 	"github.com/getarcis/arcis-go/telemetry"
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // Config holds Arcis middleware configuration for Echo.
@@ -115,6 +116,18 @@ type Config struct {
 	RateLimitWindow time.Duration
 	RateLimitSkip   func(echo.Context) bool
 	RateLimitStore  arcis.RateLimitStore // Optional external store (e.g. Redis)
+	// RateLimitOnStoreError receives store errors (the request is allowed),
+	// at most once per window. Nil logs through the standard log package.
+	RateLimitOnStoreError func(error)
+
+	// TrustedProxies lists the proxy IPs and CIDR ranges whose
+	// X-Forwarded-For entries are believed when resolving the client IP
+	// for rate limiting, telemetry and IP reputation. Nil uses the default
+	// set (loopback, link-local, private and unique-local ranges); an empty
+	// non-nil slice trusts nothing. Echo's c.RealIP() is not used, since it
+	// believes forwarded headers from any peer unless an IPExtractor is set.
+	// An invalid entry makes MiddlewareWithConfig panic.
+	TrustedProxies []string
 
 	// Bot UA classification (v1.7 W1). When Bot is true the middleware
 	// classifies the User-Agent and denies categories in BotDeny with 403.
@@ -164,6 +177,23 @@ type Config struct {
 	CacheControl      bool
 	CacheControlValue string // Custom Cache-Control value. Empty = use secure default.
 
+	// Cross-origin isolation headers (legacy profile), as in arcis.Config.
+	CrossOriginOpenerPolicy   string
+	CrossOriginResourcePolicy string
+	CrossOriginEmbedderPolicy string
+	OriginAgentCluster        bool
+	DNSPrefetchControl        bool
+
+	// HeaderProfile selects the header defaults: empty or
+	// arcis.HeaderProfileLegacy uses the fields above;
+	// arcis.HeaderProfileBaseline uses BaselineHeaders (Helmet 8
+	// compatible). An invalid baseline configuration makes
+	// MiddlewareWithConfig and HeadersWithConfig panic. With
+	// BaselineHeaders.ContentSecurityPolicy.Nonce, handlers read the nonce
+	// with arcis.CSPNonce(c.Request().Context()).
+	HeaderProfile   arcis.HeaderProfile
+	BaselineHeaders arcis.BaselineHeaderOptions
+
 	// Error handler options
 	IsDev bool
 
@@ -212,7 +242,62 @@ func DefaultConfig() Config {
 		ReferrerPolicy:    "strict-origin-when-cross-origin",
 		PermissionsPolicy: "geolocation=(), microphone=(), camera=()",
 		CacheControl:      true,
-		IsDev:             false,
+
+		CrossOriginOpenerPolicy:   "same-origin",
+		CrossOriginResourcePolicy: "same-origin",
+		CrossOriginEmbedderPolicy: "require-corp",
+		OriginAgentCluster:        true,
+		DNSPrefetchControl:        true,
+
+		IsDev: false,
+	}
+}
+
+// compileSecurityHeaders compiles the header settings in config. It
+// panics on an unknown HeaderProfile or invalid BaselineHeaders, so the
+// mistake surfaces when the middleware is built rather than per request.
+func compileSecurityHeaders(config Config) *arcis.SecurityHeaders {
+	headers, err := arcis.CompileSecurityHeaders(arcis.Config{
+		CSP:                       config.CSP,
+		FrameOptions:              config.FrameOptions,
+		HSTSMaxAge:                config.HSTSMaxAge,
+		HSTSSubdomains:            config.HSTSSubdomains,
+		ReferrerPolicy:            config.ReferrerPolicy,
+		PermissionsPolicy:         config.PermissionsPolicy,
+		CacheControl:              config.CacheControl,
+		CacheControlValue:         config.CacheControlValue,
+		CrossOriginOpenerPolicy:   config.CrossOriginOpenerPolicy,
+		CrossOriginResourcePolicy: config.CrossOriginResourcePolicy,
+		CrossOriginEmbedderPolicy: config.CrossOriginEmbedderPolicy,
+		OriginAgentCluster:        config.OriginAgentCluster,
+		DNSPrefetchControl:        config.DNSPrefetchControl,
+		HeaderProfile:             config.HeaderProfile,
+		BaselineHeaders:           config.BaselineHeaders,
+	})
+	if err != nil {
+		panic("arcis echo adapter: invalid security header configuration: " + err.Error())
+	}
+	return headers
+}
+
+// applySecurityHeaders sets the security headers before the handler runs,
+// so a header the route sets itself wins. The error comes from a CSP
+// function value and should be returned to Echo's error handler.
+func applySecurityHeaders(c echo.Context, headers *arcis.SecurityHeaders) error {
+	req, err := headers.Apply(c.Response().Header(), c.Request())
+	if err != nil {
+		return err
+	}
+	c.SetRequest(req)
+	return nil
+}
+
+// stripFingerprintHeaders removes Server, and X-Powered-By unless the
+// baseline profile keeps it. headers may be nil (headers disabled).
+func stripFingerprintHeaders(c echo.Context, headers *arcis.SecurityHeaders) {
+	c.Response().Header().Del("Server")
+	if headers == nil || headers.RemovesPoweredBy() {
+		c.Response().Header().Del("X-Powered-By")
 	}
 }
 
@@ -299,7 +384,33 @@ func registerInstance(instance *arcisInstance) {
 type RateLimitOption func(*rateLimitOpts)
 
 type rateLimitOpts struct {
-	telemetry *telemetry.Client
+	telemetry      *telemetry.Client
+	trustedProxies []string
+	onStoreError   func(error)
+}
+
+// WithTrustedProxies sets the proxy IPs and CIDR ranges whose
+// X-Forwarded-For entries a standalone rate-limit middleware believes; see
+// Config.TrustedProxies.
+func WithTrustedProxies(proxies []string) RateLimitOption {
+	return func(o *rateLimitOpts) { o.trustedProxies = proxies }
+}
+
+// WithStoreErrorHandler sets the function that receives store errors (at most
+// once per window) for a standalone rate-limit middleware. Requests are
+// allowed while the store fails.
+func WithStoreErrorHandler(fn func(error)) RateLimitOption {
+	return func(o *rateLimitOpts) { o.onStoreError = fn }
+}
+
+// newRateLimiter builds a limiter, panicking on invalid configuration because
+// the middleware constructors cannot return an error.
+func newRateLimiter(opts arcis.RateLimiterOptions) *arcis.RateLimiter {
+	limiter, err := arcis.NewRateLimiterWithOptions(opts)
+	if err != nil {
+		panic(err.Error())
+	}
+	return limiter
 }
 
 // WithTelemetry returns a RateLimitOption that attaches a telemetry
@@ -318,7 +429,7 @@ func WithTelemetry(tc *telemetry.Client) RateLimitOption {
 // emitRateLimitDeny ships one TelemetryEvent for a 429 from a standalone
 // rate-limit helper. Callers register a deferred call so the latency
 // includes the JSON write, matching MiddlewareWithConfig's measurement.
-func emitRateLimitDeny(tc *telemetry.Client, c echo.Context, start time.Time) {
+func emitRateLimitDeny(tc *telemetry.Client, c echo.Context, clientIPs *utils.ClientIPResolver, start time.Time) {
 	if tc == nil {
 		return
 	}
@@ -328,7 +439,7 @@ func emitRateLimitDeny(tc *telemetry.Client, c echo.Context, start time.Time) {
 	}
 	tc.Send(telemetry.Event{
 		Ts:        time.Now().UTC().Format(time.RFC3339),
-		IP:        c.RealIP(),
+		IP:        clientIPs.ClientIP(c.Request()),
 		Method:    c.Request().Method,
 		Path:      c.Request().URL.Path,
 		Decision:  telemetry.DecisionDeny,
@@ -351,44 +462,40 @@ func Middleware() echo.MiddlewareFunc {
 func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 	// Convert to core Arcis config
 	arcisConfig := arcis.Config{
-		Sanitize:          config.Sanitize,
-		SanitizeXSS:       config.SanitizeXSS,
-		SanitizeSQL:       config.SanitizeSQL,
-		SanitizeNoSQL:     config.SanitizeNoSQL,
-		SanitizePath:      config.SanitizePath,
-		SanitizeCmd:       config.SanitizeCmd,
-		MaxInputSize:      config.MaxInputSize,
-		RateLimit:         config.RateLimit,
-		RateLimitMax:      config.RateLimitMax,
-		RateLimitWindow:   config.RateLimitWindow,
-		Headers:           config.Headers,
-		CSP:               config.CSP,
-		FrameOptions:      config.FrameOptions,
-		HSTSMaxAge:        config.HSTSMaxAge,
-		HSTSSubdomains:    config.HSTSSubdomains,
-		ReferrerPolicy:    config.ReferrerPolicy,
-		PermissionsPolicy: config.PermissionsPolicy,
-		CacheControl:      config.CacheControl,
-		CacheControlValue: config.CacheControlValue,
-		IsDev:             config.IsDev,
+		Sanitize:        config.Sanitize,
+		SanitizeXSS:     config.SanitizeXSS,
+		SanitizeSQL:     config.SanitizeSQL,
+		SanitizeNoSQL:   config.SanitizeNoSQL,
+		SanitizePath:    config.SanitizePath,
+		SanitizeCmd:     config.SanitizeCmd,
+		MaxInputSize:    config.MaxInputSize,
+		RateLimit:       config.RateLimit,
+		RateLimitMax:    config.RateLimitMax,
+		RateLimitWindow: config.RateLimitWindow,
+		IsDev:           config.IsDev,
+	}
+
+	// Compile headers first: invalid configuration panics before any
+	// background goroutine starts.
+	var securityHeaders *arcis.SecurityHeaders
+	if config.Headers {
+		securityHeaders = compileSecurityHeaders(config)
 	}
 
 	sanitizer := arcis.NewSanitizer(arcisConfig)
 	instance := &arcisInstance{}
+	clientIPs := utils.MustClientIPResolver(config.TrustedProxies)
 
 	var rateLimiter *arcis.RateLimiter
 	if config.RateLimit {
-		if config.RateLimitStore != nil {
-			rateLimiter = arcis.NewRateLimiterWithStore(config.RateLimitMax, config.RateLimitWindow, config.RateLimitStore)
-		} else {
-			rateLimiter = arcis.NewRateLimiter(config.RateLimitMax, config.RateLimitWindow)
-		}
+		rateLimiter = newRateLimiter(arcis.RateLimiterOptions{
+			Max:            config.RateLimitMax,
+			Window:         config.RateLimitWindow,
+			Store:          config.RateLimitStore,
+			TrustedProxies: config.TrustedProxies,
+			OnStoreError:   config.RateLimitOnStoreError,
+		})
 		instance.rateLimiter = rateLimiter
-	}
-
-	var securityHeaders *arcis.SecurityHeaders
-	if config.Headers {
-		securityHeaders = arcis.NewSecurityHeaders(arcisConfig)
 	}
 
 	registerInstance(instance)
@@ -416,14 +523,11 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 	}
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			c.Response().Before(func() {
-				c.Response().Header().Del("Server")
-				c.Response().Header().Del("X-Powered-By")
-			})
+		return func(c echo.Context) (returnedErr error) {
+			c.Response().Before(func() { stripFingerprintHeaders(c, securityHeaders) })
 			if securityHeaders != nil {
-				for key, value := range securityHeaders.GetHeaders() {
-					c.Response().Header().Set(key, value)
+				if err := applySecurityHeaders(c, securityHeaders); err != nil {
+					return err
 				}
 			}
 			start := time.Now()
@@ -438,10 +542,15 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 				evtReason   string
 				evtSeverity telemetry.Severity
 			)
+			applicationPending := false
 			if config.Telemetry != nil {
 				defer func() {
 					status := c.Response().Status
-					if status == 0 {
+					if (returnedErr != nil || applicationPending) && !c.Response().Committed {
+						// The outer error handler has not finalized a response.
+						// Preserve its control flow and report unavailable.
+						status = 0
+					} else if status == 0 {
 						status = http.StatusOK
 					}
 					latency := float64(time.Since(start)) / float64(time.Millisecond)
@@ -450,7 +559,7 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 					}
 					config.Telemetry.Send(telemetry.Event{
 						Ts:             time.Now().UTC().Format(time.RFC3339),
-						IP:             c.RealIP(),
+						IP:             clientIPs.ClientIP(c.Request()),
 						Method:         c.Request().Method,
 						Path:           c.Request().URL.Path,
 						Decision:       decision,
@@ -510,7 +619,7 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 			// an unreachable service fails open. Dry-run observes cached decisions
 			// without returning an Arcis response.
 			if config.Intelligence != nil {
-				rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, c.RealIP())
+				rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, clientIPs.ClientIP(c.Request()))
 				if block {
 					if config.DryRun {
 						decision = telemetry.DecisionWouldDeny
@@ -539,9 +648,9 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 						decision = telemetry.DecisionDeny
 					}
 					evtVector = "scanner-path"
-					evtRule = "scanner-path/probe"
+					evtRule = "scanner-path/sensitive"
 					evtMatched = matched
-					evtSeverity = telemetry.SeverityHigh
+					evtSeverity = telemetry.SeverityMedium
 					evtReason = "Scanner probe path"
 					if !config.DryRun {
 						return c.JSON(http.StatusForbidden, map[string]string{
@@ -757,11 +866,12 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 			// Store sanitizer in context for use in handlers
 			c.Set(SanitizerKey, sanitizer)
 
+			applicationPending = true
 			err := next(c)
+			applicationPending = false
 
 			// Also clear the mutable map for handlers that defer their write.
-			c.Response().Header().Del("Server")
-			c.Response().Header().Del("X-Powered-By")
+			stripFingerprintHeaders(c, securityHeaders)
 
 			return err
 		}
@@ -774,32 +884,18 @@ func Headers() echo.MiddlewareFunc {
 }
 
 // HeadersWithConfig returns a headers middleware with custom configuration.
+// It panics on an invalid header configuration (see Config.HeaderProfile).
 func HeadersWithConfig(config Config) echo.MiddlewareFunc {
-	arcisConfig := arcis.Config{
-		CSP:               config.CSP,
-		FrameOptions:      config.FrameOptions,
-		HSTSMaxAge:        config.HSTSMaxAge,
-		HSTSSubdomains:    config.HSTSSubdomains,
-		ReferrerPolicy:    config.ReferrerPolicy,
-		PermissionsPolicy: config.PermissionsPolicy,
-		CacheControl:      config.CacheControl,
-		CacheControlValue: config.CacheControlValue,
-	}
-
-	headers := arcis.NewSecurityHeaders(arcisConfig)
+	headers := compileSecurityHeaders(config)
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			c.Response().Before(func() {
-				c.Response().Header().Del("Server")
-				c.Response().Header().Del("X-Powered-By")
-			})
-			for key, value := range headers.GetHeaders() {
-				c.Response().Header().Set(key, value)
+			c.Response().Before(func() { stripFingerprintHeaders(c, headers) })
+			if err := applySecurityHeaders(c, headers); err != nil {
+				return err
 			}
 			err := next(c)
-			c.Response().Header().Del("Server")
-			c.Response().Header().Del("X-Powered-By")
+			stripFingerprintHeaders(c, headers)
 			return err
 		}
 	}
@@ -825,7 +921,14 @@ func RateLimitWithStore(max int, window time.Duration, store arcis.RateLimitStor
 		opt(&o)
 	}
 
-	limiter := arcis.NewRateLimiterWithStore(max, window, store)
+	limiter := newRateLimiter(arcis.RateLimiterOptions{
+		Max:            max,
+		Window:         window,
+		Store:          store,
+		TrustedProxies: o.trustedProxies,
+		OnStoreError:   o.onStoreError,
+	})
+	clientIPs := utils.MustClientIPResolver(o.trustedProxies)
 	instance := &arcisInstance{rateLimiter: limiter}
 	registerInstance(instance)
 
@@ -836,7 +939,7 @@ func RateLimitWithStore(max int, window time.Duration, store arcis.RateLimitStor
 			if o.telemetry != nil {
 				defer func() {
 					if didDeny {
-						emitRateLimitDeny(o.telemetry, c, start)
+						emitRateLimitDeny(o.telemetry, c, clientIPs, start)
 					}
 				}()
 			}
@@ -869,7 +972,13 @@ func RateLimitWithSkip(max int, window time.Duration, skip func(echo.Context) bo
 		opt(&o)
 	}
 
-	limiter := arcis.NewRateLimiter(max, window)
+	limiter := newRateLimiter(arcis.RateLimiterOptions{
+		Max:            max,
+		Window:         window,
+		TrustedProxies: o.trustedProxies,
+		OnStoreError:   o.onStoreError,
+	})
+	clientIPs := utils.MustClientIPResolver(o.trustedProxies)
 	instance := &arcisInstance{rateLimiter: limiter}
 	registerInstance(instance)
 
@@ -880,7 +989,7 @@ func RateLimitWithSkip(max int, window time.Duration, skip func(echo.Context) bo
 			if o.telemetry != nil {
 				defer func() {
 					if didDeny {
-						emitRateLimitDeny(o.telemetry, c, start)
+						emitRateLimitDeny(o.telemetry, c, clientIPs, start)
 					}
 				}()
 			}

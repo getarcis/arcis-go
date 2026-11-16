@@ -8,17 +8,20 @@ import (
 	"time"
 
 	"github.com/getarcis/arcis-go/core"
+	"github.com/getarcis/arcis-go/internal/lru"
 	"github.com/getarcis/arcis-go/utils"
 )
 
 // SlidingWindowLimiter implements a weighted sliding window rate limiter.
 // It provides smoother rate limiting than fixed windows by weighting
 // the previous window's count based on how far into the current window we are.
+// Only the window immediately before the current one is weighted in, so a key
+// idle for a whole window starts from zero. Windows are aligned to multiples
+// of the window length at full clock precision.
 type SlidingWindowLimiter struct {
 	max      int
 	window   time.Duration
-	current  map[string]*slidingEntry
-	previous map[string]*slidingEntry
+	states   *lru.Map[*slidingState]
 	mu       sync.Mutex
 	keyFunc  func(*http.Request) string
 	skipFunc func(*http.Request) bool
@@ -26,21 +29,30 @@ type SlidingWindowLimiter struct {
 	cancel   context.CancelFunc
 }
 
-type slidingEntry struct {
-	count int
-	start time.Time
+type slidingState struct {
+	index     int64 // window number: Unix nanoseconds / window length
+	count     int   // requests counted in window index
+	prevCount int   // requests counted in window index-1
 }
 
-// NewSlidingWindowLimiter creates a new sliding window rate limiter.
+// NewSlidingWindowLimiter creates a new sliding window rate limiter. It keeps
+// at most 10,000 keys, evicting idle ones first, then the least recently used.
+// It panics when max is negative or window is not a whole number of
+// milliseconds between 1ms and MaxRateLimitWindow.
 func NewSlidingWindowLimiter(max int, window time.Duration) *SlidingWindowLimiter {
+	if err := validateRateLimit(max, window); err != nil {
+		panic(err.Error())
+	}
 	ctx, cancel := context.WithCancel(context.Background())
+	windowNs := window.Nanoseconds()
 	sw := &SlidingWindowLimiter{
-		max:      max,
-		window:   window,
-		current:  make(map[string]*slidingEntry),
-		previous: make(map[string]*slidingEntry),
-		ctx:      ctx,
-		cancel:   cancel,
+		max:    max,
+		window: window,
+		states: lru.New(defaultMaxKeys, func(s *slidingState, now time.Time) bool {
+			return now.UnixNano()/windowNs-s.index > 1
+		}),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	// Cleanup goroutine
@@ -69,6 +81,8 @@ func NewSlidingWindowLimiter(max int, window time.Duration) *SlidingWindowLimite
 }
 
 // SetKeyFunc sets a custom function to extract the rate limit key from requests.
+// Use it with a utils.ClientIPResolver when the app sits behind proxies
+// outside the default trust set.
 func (sw *SlidingWindowLimiter) SetKeyFunc(fn func(*http.Request) string) {
 	sw.keyFunc = fn
 }
@@ -78,7 +92,8 @@ func (sw *SlidingWindowLimiter) SetSkipFunc(fn func(*http.Request) bool) {
 	sw.skipFunc = fn
 }
 
-// Check checks if a request is within the rate limit.
+// Check checks if a request is within the rate limit. The default key is
+// utils.RateLimitKey(utils.GetClientIP(r)).
 func (sw *SlidingWindowLimiter) Check(r *http.Request) core.RateLimitResult {
 	if sw.skipFunc != nil && sw.skipFunc(r) {
 		return core.RateLimitResult{
@@ -89,9 +104,11 @@ func (sw *SlidingWindowLimiter) Check(r *http.Request) core.RateLimitResult {
 		}
 	}
 
-	key := utils.GetClientIP(r)
+	var key string
 	if sw.keyFunc != nil {
 		key = sw.keyFunc(r)
+	} else {
+		key = utils.RateLimitKey(utils.GetClientIP(r))
 	}
 
 	return sw.CheckKey(key)
@@ -99,43 +116,39 @@ func (sw *SlidingWindowLimiter) Check(r *http.Request) core.RateLimitResult {
 
 // CheckKey checks rate limit for a specific key using the sliding window algorithm.
 func (sw *SlidingWindowLimiter) CheckKey(key string) core.RateLimitResult {
+	return sw.checkAt(key, time.Now())
+}
+
+func (sw *SlidingWindowLimiter) checkAt(key string, now time.Time) core.RateLimitResult {
+	nowNs := now.UnixNano()
+	windowNs := sw.window.Nanoseconds()
+	index := nowNs / windowNs
+	windowEnd := (index + 1) * windowNs
+
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 
-	now := time.Now()
-	windowSec := sw.window.Seconds()
-
-	// Calculate current window boundaries
-	windowStart := time.Unix(int64(math.Floor(float64(now.Unix())/windowSec)*windowSec), 0)
-
-	// Rotate windows if needed
-	if entry, exists := sw.current[key]; exists {
-		if entry.start.Before(windowStart) {
-			sw.previous[key] = entry
-			sw.current[key] = &slidingEntry{count: 0, start: windowStart}
+	state, ok := sw.states.Get(key)
+	if !ok {
+		state = &slidingState{index: index}
+		sw.states.Put(key, state, now)
+	} else if state.index != index {
+		// The previous count carries over only from the immediately
+		// preceding window.
+		if state.index == index-1 {
+			state.prevCount = state.count
+		} else {
+			state.prevCount = 0
 		}
+		state.index = index
+		state.count = 0
 	}
 
-	// Get previous and current counts
-	prevCount := 0
-	if prev, exists := sw.previous[key]; exists {
-		prevCount = prev.count
-	}
-
-	currentCount := 0
-	if curr, exists := sw.current[key]; exists {
-		currentCount = curr.count
-	}
-
-	// Calculate weighted estimate
-	elapsed := now.Sub(windowStart).Seconds()
-	weight := math.Max(0, (windowSec-elapsed)/windowSec)
-	estimatedCount := float64(prevCount)*weight + float64(currentCount) + 1
-
-	// Calculate reset time
-	resetDuration := windowStart.Add(sw.window).Sub(now)
-
-	remaining := int(math.Max(0, math.Floor(float64(sw.max)-estimatedCount)))
+	// Weight the previous window by the share of it still inside the
+	// sliding window.
+	weight := float64(windowEnd-nowNs) / float64(windowNs)
+	estimatedCount := float64(state.prevCount)*weight + float64(state.count) + 1
+	resetDuration := time.Duration(windowEnd - nowNs)
 
 	if estimatedCount > float64(sw.max) {
 		return core.RateLimitResult{
@@ -147,15 +160,12 @@ func (sw *SlidingWindowLimiter) CheckKey(key string) core.RateLimitResult {
 	}
 
 	// Only increment if allowed
-	if _, exists := sw.current[key]; !exists {
-		sw.current[key] = &slidingEntry{count: 0, start: windowStart}
-	}
-	sw.current[key].count++
+	state.count++
 
 	return core.RateLimitResult{
 		Allowed:   true,
 		Limit:     sw.max,
-		Remaining: remaining,
+		Remaining: int(math.Max(0, math.Floor(float64(sw.max)-estimatedCount))),
 		Reset:     resetDuration,
 	}
 }
@@ -168,23 +178,5 @@ func (sw *SlidingWindowLimiter) Close() {
 func (sw *SlidingWindowLimiter) cleanup() {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
-
-	now := time.Now()
-	windowSec := sw.window.Seconds()
-	windowStart := time.Unix(int64(math.Floor(float64(now.Unix())/windowSec)*windowSec), 0)
-
-	// Remove stale previous entries
-	for key, entry := range sw.previous {
-		if entry.start.Before(windowStart.Add(-sw.window)) {
-			delete(sw.previous, key)
-		}
-	}
-
-	// Remove stale current entries (promote to previous if needed)
-	for key, entry := range sw.current {
-		if entry.start.Before(windowStart) {
-			sw.previous[key] = entry
-			delete(sw.current, key)
-		}
-	}
+	sw.states.RemoveExpired(time.Now())
 }

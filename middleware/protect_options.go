@@ -12,8 +12,8 @@ import (
 // lives here. Each adapter (gin / echo / chi / fiber / nethttp) builds a
 // framework-native middleware that:
 //
-//   - extracts the client IP (X-Forwarded-For first hop, then the
-//     framework's native client-IP / RemoteAddr),
+//   - resolves the client IP from the socket peer, believing
+//     X-Forwarded-For only from TrustedProxies (utils.ClientIPResolver),
 //   - extracts the route / path,
 //   - pulls a distinct value (username / email) from the configured JSON
 //     body field, restoring the body stream so downstream handlers can
@@ -53,6 +53,11 @@ type ProtectOptions struct {
 	// Message is the value of the JSON "error" field in the block
 	// response. Empty defaults to "Suspicious request pattern detected.".
 	Message string
+
+	// TrustedProxies configures client IP resolution; see
+	// core.Config.TrustedProxies. Nil uses the default trust set. An
+	// invalid entry makes the Protect* factory panic.
+	TrustedProxies []string
 }
 
 // Vector tags recorded in the correlation window per endpoint shape.

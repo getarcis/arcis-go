@@ -129,7 +129,7 @@ func TestFiberTelemetry_DryRunRequestDetectorsReachHandlerAndEmitWouldDeny(t *te
 			path:         "/.env",
 			scannerPaths: true,
 			vector:       "scanner-path",
-			rule:         "scanner-path/probe",
+			rule:         "scanner-path/sensitive",
 		},
 		{
 			name:         "forwarded loopback spoof",

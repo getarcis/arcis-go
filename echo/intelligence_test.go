@@ -50,7 +50,7 @@ func intelApp(cfg Config) *echo.Echo {
 
 func statusFor(e *echo.Echo, ip string) int {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-Forwarded-For", ip) // echo c.RealIP() reads this
+	req.RemoteAddr = ip + ":1234" // the peer is the client (no proxy)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	w := httptest.NewRecorder()
 	e.ServeHTTP(w, req)

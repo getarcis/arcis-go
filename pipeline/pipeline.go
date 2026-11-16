@@ -14,12 +14,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // ScanRequestForThreats walks an HTTP request (body, query, URL path) and
@@ -99,21 +99,9 @@ func ScanRequestForThreats(req *http.Request) *arcis.ThreatHit {
 	return nil
 }
 
-// ClientIP returns the request's client IP for telemetry. Honors
-// X-Forwarded-For (first value), then X-Real-IP, then the host portion of
-// RemoteAddr. Mirrors gin's ClientIP() and echo's RealIP().
+// ClientIP returns the request's client IP using the default trusted proxies
+// (utils.GetClientIP): X-Forwarded-For is read right to left and only when
+// RemoteAddr is a loopback, link-local or private proxy.
 func ClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-		return strings.TrimSpace(xrip)
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
+	return utils.GetClientIP(r)
 }

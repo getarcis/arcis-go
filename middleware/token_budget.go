@@ -3,11 +3,12 @@ package middleware
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // Token-budget protection middleware. Caps per-key token spend over a
@@ -31,8 +32,8 @@ type TokenBudgetOptions struct {
 	// charged). Default: 0 (no per-request cap).
 	MaxRequestTokens int
 
-	// KeyGenerator returns the budget key for a request. Default: client
-	// IP, falling back to "unknown" when unresolvable.
+	// KeyGenerator returns the budget key for a request. Default:
+	// utils.RateLimitKey(utils.GetClientIP(r)), "unknown" when unresolvable.
 	KeyGenerator func(*http.Request) string
 
 	// EstimateTokens computes the token cost of a request. Default:
@@ -250,24 +251,7 @@ func (tb *TokenBudget) Middleware() func(http.Handler) http.Handler {
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 func defaultTokenBudgetKey(r *http.Request) string {
-	// X-Forwarded-For (first hop) wins when present, then RemoteAddr.
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// take first comma-separated value
-		for i := 0; i < len(xff); i++ {
-			if xff[i] == ',' {
-				return trimSpaces(xff[:i])
-			}
-		}
-		return trimSpaces(xff)
-	}
-	if r.RemoteAddr != "" {
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err == nil {
-			return host
-		}
-		return r.RemoteAddr
-	}
-	return "unknown"
+	return utils.RateLimitKey(utils.GetClientIP(r))
 }
 
 func defaultEstimateTokens(r *http.Request) int {
@@ -297,14 +281,4 @@ func writeJSONError(w http.ResponseWriter, status int, body map[string]any) {
 		return
 	}
 	_, _ = w.Write(encoded)
-}
-
-func trimSpaces(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
-	}
-	return s
 }

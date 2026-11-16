@@ -103,7 +103,7 @@ func TestProtectLogin_HonorsXForwardedFor(t *testing.T) {
 	win := arcis.NewCorrelationWindow(arcis.NewCorrelationWindowOptions())
 	e := echo.New()
 	e.POST("/login", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, map[string]interface{}{"ip": protectClientIP(c)})
+		return c.JSON(http.StatusOK, map[string]interface{}{"ok": true})
 	}, ProtectLogin(ProtectOptions{Window: win}))
 
 	var lastCode int
@@ -125,14 +125,25 @@ func TestProtectLogin_HonorsXForwardedFor(t *testing.T) {
 	}
 }
 
-func TestProtectClientIP_FirstHop(t *testing.T) {
+func TestProtectLogin_PublicPeerCannotRotateXForwardedFor(t *testing.T) {
+	win := arcis.NewCorrelationWindow(arcis.NewCorrelationWindowOptions())
 	e := echo.New()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-Forwarded-For", "192.0.2.7, 10.0.0.1")
-	req.RemoteAddr = "10.0.0.9:1234"
-	c := e.NewContext(req, httptest.NewRecorder())
-	if got := protectClientIP(c); got != "192.0.2.7" {
-		t.Fatalf("expected first XFF hop 192.0.2.7, got %q", got)
+	e.POST("/login", func(c echo.Context) error {
+		return c.NoContent(http.StatusOK)
+	}, ProtectLogin(ProtectOptions{Window: win}))
+
+	var lastCode int
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(fmt.Sprintf(`{"username":"cred%d"}`, i)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("192.0.2.%d", i+1))
+		req.RemoteAddr = "198.51.100.9:9000"
+		w := httptest.NewRecorder()
+		e.ServeHTTP(w, req)
+		lastCode = w.Code
+	}
+	if lastCode != http.StatusTooManyRequests {
+		t.Fatalf("rotating XFF from a public peer must aggregate on the peer and trip 429, got %d", lastCode)
 	}
 }
 

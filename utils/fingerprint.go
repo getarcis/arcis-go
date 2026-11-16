@@ -17,7 +17,7 @@ type FingerprintOptions struct {
 	AcceptLanguage bool             // Include Accept-Language header (default: true)
 	AcceptEncoding bool             // Include Accept-Encoding header (default: true)
 	Custom         []string         // Additional custom components
-	IPOptions      *DetectIPOptions // Options for IP detection
+	IPOptions      *DetectIPOptions // Platform-aware IP detection; nil uses GetClientIP
 }
 
 // DefaultFingerprintOptions returns fingerprint options with all defaults enabled.
@@ -42,7 +42,10 @@ func Fingerprint(r *http.Request, opts *FingerprintOptions) string {
 	var components []string
 
 	if o.IP {
-		ip := DetectClientIP(r, o.IPOptions)
+		ip := GetClientIP(r)
+		if o.IPOptions != nil {
+			ip = DetectClientIP(r, o.IPOptions)
+		}
 		components = append(components, fmt.Sprintf("ip:%s", ip))
 	}
 

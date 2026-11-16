@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// ─── Legacy GetClientIP tests ────────────────────────────────────────────────
+// ─── GetClientIP tests ───────────────────────────────────────────────────────
 
 func TestGetClientIP(t *testing.T) {
 	tests := []struct {
@@ -17,8 +17,11 @@ func TestGetClientIP(t *testing.T) {
 		expected   string
 	}{
 		{"uses RemoteAddr", "192.168.1.1:12345", "", "", "192.168.1.1"},
-		{"prefers X-Forwarded-For", "127.0.0.1:12345", "10.0.0.1, 192.168.1.1", "", "10.0.0.1"},
-		{"uses X-Real-IP", "127.0.0.1:12345", "", "10.0.0.2", "10.0.0.2"},
+		{"IPv6 RemoteAddr without brackets", "[2001:db8::1]:443", "", "", "2001:db8::1"},
+		{"reads XFF right to left behind a trusted proxy", "127.0.0.1:12345", "203.0.113.9, 192.168.1.1", "", "203.0.113.9"},
+		{"ignores XFF from a public peer", "198.51.100.4:12345", "203.0.113.9", "", "198.51.100.4"},
+		{"spoofed left-most entry does not win", "10.0.0.5:12345", "1.1.1.1, 203.0.113.9", "", "203.0.113.9"},
+		{"ignores X-Real-IP", "127.0.0.1:12345", "", "10.0.0.2", "127.0.0.1"},
 	}
 
 	for _, tt := range tests {

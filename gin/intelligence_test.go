@@ -52,7 +52,7 @@ func intelEngine(t *testing.T, cfg Config) *gin.Engine {
 
 func getStatus(r *gin.Engine, ip string) int {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-Forwarded-For", ip)
+	req.RemoteAddr = ip + ":1234" // the peer is the client (no proxy)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

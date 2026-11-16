@@ -36,28 +36,22 @@ var (
 	platformOnce     sync.Once
 )
 
-// GetClientIP extracts the client IP address from the request,
-// handling common proxy headers. This is the simple/legacy version.
+// GetClientIP returns the client IP of r using the default trust set
+// (loopback, link-local, private and unique-local proxies). X-Forwarded-For is
+// believed only when the socket peer (r.RemoteAddr) is one of those proxies,
+// and is read right to left, so a client on the public internet cannot choose
+// its own address. X-Real-IP is no longer consulted. Returns "" when no
+// address can be determined. Use NewClientIPResolver for other proxy setups.
 func GetClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header (comma-separated list, first is client)
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-
-	// Check X-Real-IP header
-	xri := r.Header.Get("X-Real-IP")
-	if xri != "" {
-		return xri
-	}
-
-	// Fall back to RemoteAddr
-	return extractIP(r.RemoteAddr)
+	return defaultResolver.ClientIP(r)
 }
 
 // DetectClientIP extracts the client IP using platform-aware header detection.
-// It reads from the right side of X-Forwarded-For to prevent client spoofing.
+// It reads from the right side of X-Forwarded-For.
+//
+// WARNING: it believes platform headers and X-Forwarded-For from any peer, so
+// it is only safe where the platform overwrites them. Arcis does not use it
+// for rate-limit or tracking keys; use GetClientIP or ClientIPResolver.
 func DetectClientIP(r *http.Request, opts *DetectIPOptions) string {
 	platform := PlatformAuto
 	trustedProxyCount := 1

@@ -42,10 +42,11 @@ func intelStub(verdicts map[string]int, hits *int32) *httptest.Server {
 	}))
 }
 
-// intelApp builds a fiber app whose c.IP() reads X-Forwarded-For (ProxyHeader),
-// so the test can drive the looked-up IP.
+// intelApp builds a fiber app that trusts the app.Test peer (0.0.0.0) as a
+// proxy, so X-Forwarded-For drives the looked-up IP.
 func intelApp(cfg Config) *fiber.App {
-	app := fiber.New(fiber.Config{DisableStartupMessage: true, ProxyHeader: fiber.HeaderXForwardedFor})
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	cfg.TrustedProxies = []string{"0.0.0.0"}
 	app.Use(MiddlewareWithConfig(cfg))
 	app.Get("/", func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"ok": true}) })
 	return app

@@ -6,6 +6,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // improvements.md §1.4 (Go variant) — composite protect factories for
@@ -31,22 +32,6 @@ import (
 // shared arcis.ProtectOptions so one config struct works across adapters.
 type ProtectOptions = arcis.ProtectOptions
 
-// protectClientIP returns the request client IP. Honors X-Forwarded-For
-// (first hop) per the documented contract, then falls back to fiber's
-// native c.IP() (which honours fiber's TrustedProxies config).
-func protectClientIP(c *fiber.Ctx) string {
-	if xff := c.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			if first := strings.TrimSpace(xff[:i]); first != "" {
-				return first
-			}
-		} else if first := strings.TrimSpace(xff); first != "" {
-			return first
-		}
-	}
-	return c.IP()
-}
-
 // protectUsernameField returns the configured username field or "username".
 func protectUsernameField(opts ProtectOptions) string {
 	if opts.UsernameField != "" {
@@ -62,15 +47,17 @@ func protectUsernameField(opts ProtectOptions) string {
 // extraction reads the same buffer the downstream handler's c.BodyParser
 // reads, so the body stays intact.
 func protect(vector string, opts ProtectOptions) fiber.Handler {
+	clientIPs := utils.MustClientIPResolver(opts.TrustedProxies)
 	return func(c *fiber.Ctx) error {
-		ip := protectClientIP(c)
+		ip := clientIP(clientIPs, c)
 		username := ""
 		if strings.HasPrefix(c.Get("Content-Type"), "application/json") {
 			username = arcis.ExtractUsername(c.Body(), protectUsernameField(opts))
 		}
 		route := c.Route().Path
 		if route == "" {
-			route = c.Path()
+			// c.Path() aliases a reused fasthttp buffer; the window keeps it.
+			route = strings.Clone(c.Path())
 		}
 		decision := arcis.ResolveProtect(opts, vector, ip, route, c.Method(), username)
 		if decision.Block {

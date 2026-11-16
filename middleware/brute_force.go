@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/getarcis/arcis-go/internal/lru"
 	"github.com/getarcis/arcis-go/utils"
 )
 
@@ -37,8 +38,13 @@ type BruteForceConfig struct {
 	BlockDuration time.Duration              // block length after slow-window exhaustion (default 15m)
 	StatusCode    int                        // HTTP status when denied (default 429)
 	Message       string                     // response message when denied
-	KeyFunc       func(*http.Request) string // key resolver (default: client IP)
+	KeyFunc       func(*http.Request) string // key resolver (default: utils.RateLimitKey of the client IP)
 	Skip          func(*http.Request) bool   // return true to bypass for this request
+
+	// TrustedProxies configures client IP resolution for the default key;
+	// see core.Config.TrustedProxies. Nil uses the default trust set. An
+	// invalid entry makes NewBruteForce panic.
+	TrustedProxies []string
 }
 
 // BruteForceResult is the outcome of a brute-force check.
@@ -48,26 +54,36 @@ type BruteForceResult struct {
 	Remaining  int           // fast-window attempts remaining when Allowed
 }
 
-type bfEntry struct {
-	count     int
-	resetTime time.Time
+// bfState is one key's fast window, slow window and block.
+type bfState struct {
+	fastCount    int
+	fastReset    time.Time
+	slowCount    int
+	slowReset    time.Time
+	blockedUntil time.Time
+}
+
+// expired reports whether the state no longer affects any decision.
+func (s *bfState) expired(now time.Time) bool {
+	return s.fastReset.Before(now) && s.slowReset.Before(now) && !now.Before(s.blockedUntil)
 }
 
 // BruteForce is a two-tier (fast + slow + block) brute-force limiter. It is
-// safe for concurrent use.
+// safe for concurrent use. It tracks at most 10,000 keys; at the cap it drops
+// keys with no live window or block first, then the least recently used.
 type BruteForce struct {
-	cfg     BruteForceConfig
-	fast    map[string]*bfEntry
-	slow    map[string]*bfEntry
-	blocked map[string]time.Time // key -> time the block expires
-	mu      sync.Mutex
-	ctx     context.Context
-	cancel  context.CancelFunc
+	cfg      BruteForceConfig
+	resolver *utils.ClientIPResolver
+	states   *lru.Map[*bfState]
+	mu       sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // NewBruteForce builds a brute-force limiter, applying defaults for any zero
 // config fields and starting a background cleanup goroutine (stopped via
-// Close). Mirrors NewRateLimiter's lifecycle.
+// Close). Mirrors NewRateLimiter's lifecycle. It panics when
+// cfg.TrustedProxies has an invalid entry.
 func NewBruteForce(cfg BruteForceConfig) *BruteForce {
 	if cfg.FastPoints <= 0 {
 		cfg.FastPoints = 5
@@ -91,14 +107,15 @@ func NewBruteForce(cfg BruteForceConfig) *BruteForce {
 		cfg.Message = "Too many attempts. Please try again later."
 	}
 
+	resolver := utils.MustClientIPResolver(cfg.TrustedProxies)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &BruteForce{
-		cfg:     cfg,
-		fast:    make(map[string]*bfEntry),
-		slow:    make(map[string]*bfEntry),
-		blocked: make(map[string]time.Time),
-		ctx:     ctx,
-		cancel:  cancel,
+		cfg:      cfg,
+		resolver: resolver,
+		states:   lru.New(defaultMaxKeys, (*bfState).expired),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
 	// Prune expired entries on the slow-window cadence so the maps stay
@@ -125,24 +142,23 @@ func (b *BruteForce) CheckKey(key string) BruteForceResult {
 	defer b.mu.Unlock()
 	now := time.Now()
 
+	st := b.state(key, now)
+
 	// 1. Block state first — a tripped block denies everything until it expires.
-	if until, ok := b.blocked[key]; ok {
-		if now.Before(until) {
-			return BruteForceResult{Allowed: false, RetryAfter: until.Sub(now)}
-		}
-		delete(b.blocked, key)
+	if now.Before(st.blockedUntil) {
+		return BruteForceResult{Allowed: false, RetryAfter: st.blockedUntil.Sub(now)}
 	}
 
 	// 2. Slow window — exhausting it trips the semi-permanent block.
-	if slowCount := bump(b.slow, key, b.cfg.SlowDuration, now); slowCount > b.cfg.SlowPoints {
-		b.blocked[key] = now.Add(b.cfg.BlockDuration)
+	if slowCount := bump(&st.slowCount, &st.slowReset, b.cfg.SlowDuration, now); slowCount > b.cfg.SlowPoints {
+		st.blockedUntil = now.Add(b.cfg.BlockDuration)
 		return BruteForceResult{Allowed: false, RetryAfter: b.cfg.BlockDuration}
 	}
 
 	// 3. Fast window — short-term 429, resets on its own, no block.
-	fastCount := bump(b.fast, key, b.cfg.FastDuration, now)
+	fastCount := bump(&st.fastCount, &st.fastReset, b.cfg.FastDuration, now)
 	if fastCount > b.cfg.FastPoints {
-		return BruteForceResult{Allowed: false, RetryAfter: b.fast[key].resetTime.Sub(now)}
+		return BruteForceResult{Allowed: false, RetryAfter: st.fastReset.Sub(now)}
 	}
 
 	remaining := b.cfg.FastPoints - fastCount
@@ -152,17 +168,30 @@ func (b *BruteForce) CheckKey(key string) BruteForceResult {
 	return BruteForceResult{Allowed: true, Remaining: remaining}
 }
 
-// Check resolves the key from the request (KeyFunc or client IP) and consumes
-// one attempt. Honors Skip.
+// Check resolves the key from the request (see Key) and consumes one attempt.
+// Honors Skip.
 func (b *BruteForce) Check(r *http.Request) BruteForceResult {
 	if b.cfg.Skip != nil && b.cfg.Skip(r) {
 		return BruteForceResult{Allowed: true, Remaining: b.cfg.FastPoints}
 	}
-	key := utils.GetClientIP(r)
+	return b.CheckKey(b.Key(r))
+}
+
+// CheckPeer consumes one attempt for the client resolved from a socket peer
+// address and X-Forwarded-For values, for frameworks without an
+// *http.Request (Fiber). KeyFunc and Skip are not consulted.
+func (b *BruteForce) CheckPeer(peer string, xForwardedFor []string) BruteForceResult {
+	return b.CheckKey(utils.RateLimitKey(b.resolver.Resolve(peer, xForwardedFor...)))
+}
+
+// Key returns the key Check uses for r: KeyFunc(r) when set, otherwise the
+// client IP resolved with TrustedProxies and passed through
+// utils.RateLimitKey. Pass it to Reset after a successful login.
+func (b *BruteForce) Key(r *http.Request) string {
 	if b.cfg.KeyFunc != nil {
-		key = b.cfg.KeyFunc(r)
+		return b.cfg.KeyFunc(r)
 	}
-	return b.CheckKey(key)
+	return utils.RateLimitKey(b.resolver.ClientIP(r))
 }
 
 // Reset clears the failure counters and any block for key. Call this after a
@@ -171,9 +200,7 @@ func (b *BruteForce) Check(r *http.Request) BruteForceResult {
 func (b *BruteForce) Reset(key string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	delete(b.fast, key)
-	delete(b.slow, key)
-	delete(b.blocked, key)
+	b.states.Delete(key)
 }
 
 // Block manually trips a block for key for the given duration (e.g. after the
@@ -181,7 +208,8 @@ func (b *BruteForce) Reset(key string) {
 func (b *BruteForce) Block(key string, d time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.blocked[key] = time.Now().Add(d)
+	now := time.Now()
+	b.state(key, now).blockedUntil = now.Add(d)
 }
 
 // StatusCode returns the resolved HTTP status used when a request is denied.
@@ -196,8 +224,8 @@ func (b *BruteForce) Message() string { return b.cfg.Message }
 func (b *BruteForce) IsBlocked(key string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	until, ok := b.blocked[key]
-	return ok && time.Now().Before(until)
+	st, ok := b.states.Peek(key)
+	return ok && time.Now().Before(st.blockedUntil)
 }
 
 // Handler wraps next with brute-force protection: a denied request gets the
@@ -231,31 +259,25 @@ func (b *BruteForce) Close() {
 func (b *BruteForce) cleanup() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	now := time.Now()
-	for k, e := range b.fast {
-		if e.resetTime.Before(now) {
-			delete(b.fast, k)
-		}
+	b.states.RemoveExpired(time.Now())
+}
+
+// state returns key's state, creating it if needed. Callers hold b.mu.
+func (b *BruteForce) state(key string, now time.Time) *bfState {
+	st, ok := b.states.Get(key)
+	if !ok {
+		st = &bfState{}
+		b.states.Put(key, st, now)
 	}
-	for k, e := range b.slow {
-		if e.resetTime.Before(now) {
-			delete(b.slow, k)
-		}
-	}
-	for k, until := range b.blocked {
-		if now.After(until) {
-			delete(b.blocked, k)
-		}
-	}
+	return st
 }
 
 // bump increments a windowed counter, resetting it if the window has elapsed.
-func bump(m map[string]*bfEntry, key string, dur time.Duration, now time.Time) int {
-	e, ok := m[key]
-	if !ok || e.resetTime.Before(now) {
-		m[key] = &bfEntry{count: 1, resetTime: now.Add(dur)}
-		return 1
+func bump(count *int, reset *time.Time, dur time.Duration, now time.Time) int {
+	if reset.Before(now) {
+		*count = 0
+		*reset = now.Add(dur)
 	}
-	e.count++
-	return e.count
+	*count++
+	return *count
 }
