@@ -50,7 +50,7 @@ func intelHandler(cfg Config) http.Handler {
 
 func statusFor(h http.Handler, ip string) int {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-Forwarded-For", ip) // pipeline.ClientIP reads this first
+	req.RemoteAddr = ip + ":1234" // the peer is the client (no proxy)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)

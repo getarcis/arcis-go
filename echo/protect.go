@@ -8,6 +8,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // improvements.md §1.4 (Go variant) — composite protect factories for Echo.
@@ -31,22 +32,6 @@ import (
 // ProtectOptions configures the Echo protect factories. Aliased to the
 // shared arcis.ProtectOptions so one config struct works across adapters.
 type ProtectOptions = arcis.ProtectOptions
-
-// protectClientIP returns the request client IP. Honors X-Forwarded-For
-// (first hop) per the documented contract, then falls back to echo's
-// native RealIP().
-func protectClientIP(c echo.Context) string {
-	if xff := c.Request().Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			if first := strings.TrimSpace(xff[:i]); first != "" {
-				return first
-			}
-		} else if first := strings.TrimSpace(xff); first != "" {
-			return first
-		}
-	}
-	return c.RealIP()
-}
 
 // protectUsername reads the JSON request body, pulls the configured
 // username field, and restores the body stream.
@@ -77,11 +62,14 @@ func protectUsernameField(opts ProtectOptions) string {
 	return "username"
 }
 
-// protect builds the shared Echo middleware for a given vector tag.
+// protect builds the shared Echo middleware for a given vector tag. The
+// client IP comes from the socket peer and X-Forwarded-For entries added by
+// opts.TrustedProxies, never from echo's c.RealIP().
 func protect(vector string, opts ProtectOptions) echo.MiddlewareFunc {
+	clientIPs := utils.MustClientIPResolver(opts.TrustedProxies)
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			ip := protectClientIP(c)
+			ip := clientIPs.ClientIP(c.Request())
 			username := protectUsername(c, protectUsernameField(opts))
 			route := c.Path()
 			if route == "" {

@@ -77,8 +77,8 @@ func TestProtectLogin_TripsCredentialStuffing(t *testing.T) {
 	app := protectApp(win)
 
 	// 10 distinct usernames from one client trip the default threshold.
-	// fiber's c.IP() returns the test RemoteAddr (0.0.0.0) for all of
-	// these, which is a stable correlation key for the run.
+	// app.Test connects from 0.0.0.0 for all of these, which is a stable
+	// correlation key for the run.
 	var lastCode int
 	for i := 0; i < 10; i++ {
 		res := postJSON(t, app, "/login", fmt.Sprintf(`{"username":"user%d"}`, i), "")
@@ -89,22 +89,21 @@ func TestProtectLogin_TripsCredentialStuffing(t *testing.T) {
 	}
 }
 
-func TestProtectLogin_HonorsXForwardedFor(t *testing.T) {
+func TestProtectLogin_UntrustedPeerCannotRotateXForwardedFor(t *testing.T) {
 	win := arcis.NewCorrelationWindow(arcis.NewCorrelationWindowOptions())
 	app := protectApp(win)
 
-	// All requests share the same XFF first hop; the protect helper keys
-	// off it directly, so they aggregate and trip even though fiber's
-	// default c.IP() ignores XFF.
+	// The app.Test peer (0.0.0.0) is not a trusted proxy, so each rotated
+	// XFF value is ignored: the requests aggregate on the peer and trip.
 	var lastCode int
 	var lastBody []byte
 	for i := 0; i < 10; i++ {
-		res := postJSON(t, app, "/login", fmt.Sprintf(`{"username":"cred%d"}`, i), "192.0.2.55, 10.0.0.1")
+		res := postJSON(t, app, "/login", fmt.Sprintf(`{"username":"cred%d"}`, i), fmt.Sprintf("192.0.2.%d", i+1))
 		lastCode = res.StatusCode
 		lastBody, _ = io.ReadAll(res.Body)
 	}
 	if lastCode != http.StatusTooManyRequests {
-		t.Fatalf("expected XFF-aggregated requests to trip 429, got %d (body=%s)", lastCode, string(lastBody))
+		t.Fatalf("expected rotated-XFF requests to aggregate and trip 429, got %d (body=%s)", lastCode, string(lastBody))
 	}
 	var resp map[string]interface{}
 	if err := json.Unmarshal(lastBody, &resp); err != nil {

@@ -122,6 +122,20 @@ func WithTelemetry(tc *telemetry.Client) RateLimitOption {
 	return arcischi.WithTelemetry(tc)
 }
 
+// WithTrustedProxies sets the proxy IPs and CIDR ranges whose
+// X-Forwarded-For entries a standalone rate-limit middleware believes; see
+// Config.TrustedProxies.
+func WithTrustedProxies(proxies []string) RateLimitOption {
+	return arcischi.WithTrustedProxies(proxies)
+}
+
+// WithStoreErrorHandler sets the function that receives store errors (at
+// most once per window) for a standalone rate-limit middleware. Requests
+// are allowed while the store fails.
+func WithStoreErrorHandler(fn func(error)) RateLimitOption {
+	return arcischi.WithStoreErrorHandler(fn)
+}
+
 // Middleware returns the default Arcis middleware: rate limiting,
 // security headers, server-fingerprint stripping. Composes with any
 // router that accepts stdlib middleware (`func(http.Handler) http.Handler`).

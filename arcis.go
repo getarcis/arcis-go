@@ -93,6 +93,7 @@ type Config = core.Config
 type RateLimitResult = core.RateLimitResult
 type RateLimitEntry = core.RateLimitEntry
 type RateLimitStore = core.RateLimitStore
+type RateLimitStoreGetter = core.RateLimitStoreGetter
 type InputTooLargeError = core.InputTooLargeError
 
 // Security header profile types. See core.BaselineHeaderOptions.
@@ -218,6 +219,11 @@ type ValidateHostResult = validation.ValidateHostResult
 type RedisClient = stores.RedisClient
 type RedisStoreOptions = stores.RedisStoreOptions
 type RedisRateLimitStore = stores.RedisRateLimitStore
+type MemoryStore = stores.MemoryStore
+
+// Client IP resolution types
+type ClientIPResolver = utils.ClientIPResolver
+type RateLimiterOptions = middleware.RateLimiterOptions
 
 // ─── Constants (re-exported) ────────────────────────────────────────────────
 
@@ -287,6 +293,10 @@ var NewRateLimiter = middleware.NewRateLimiter
 
 // NewRateLimiterWithStore creates a new RateLimiter backed by the provided store.
 var NewRateLimiterWithStore = middleware.NewRateLimiterWithStore
+
+// NewRateLimiterWithOptions validates options and creates a RateLimiter,
+// returning an error for an invalid max, window or trusted proxy entry.
+var NewRateLimiterWithOptions = middleware.NewRateLimiterWithOptions
 
 // NewSecurityHeaders creates a new SecurityHeaders with the given
 // configuration. It always builds the legacy profile; use
@@ -406,8 +416,20 @@ var ValidateRedirect = utils.ValidateRedirect
 // IsRedirectSafe is a convenience wrapper that returns true/false.
 var IsRedirectSafe = utils.IsRedirectSafe
 
-// GetClientIP extracts the client IP address from the request.
+// GetClientIP returns the client IP of the request, believing
+// X-Forwarded-For only from the default trusted proxies.
 var GetClientIP = utils.GetClientIP
+
+// NewClientIPResolver builds a client IP resolver from trusted proxy IPs and
+// CIDR ranges (nil = default set, empty = trust nothing).
+var NewClientIPResolver = utils.NewClientIPResolver
+
+// RateLimitKey turns a resolved client IP into a rate-limit key (IPv6 grouped
+// to /56).
+var RateLimitKey = utils.RateLimitKey
+
+// IPKey is RateLimitKey with a configurable IPv6 prefix length.
+var IPKey = utils.IPKey
 
 // ─── Tier 2: Rate Limiter Variants ──────────────────────────────────────────
 
@@ -527,6 +549,9 @@ var RedactObjectPii = sanitizers.RedactObjectPii
 
 // NewRedisRateLimitStore creates a new Redis-backed rate limit store.
 var NewRedisRateLimitStore = stores.NewRedisRateLimitStore
+
+// NewMemoryStore creates the size-capped in-memory rate limit store.
+var NewMemoryStore = stores.NewMemoryStore
 
 // ─── Standalone Sanitize Functions ───────────────────────────────────────────
 
@@ -846,7 +871,10 @@ func New() *Arcis {
 // NewWithConfig creates a new Arcis instance with custom configuration.
 // It panics if config.HeaderProfile is unknown or the baseline header
 // options are invalid, so the mistake surfaces at startup; use
-// CompileSecurityHeaders to validate them as an error instead.
+// CompileSecurityHeaders to validate them as an error instead. With
+// RateLimit enabled it also panics on an invalid RateLimitMax,
+// RateLimitWindow or TrustedProxies entry (NewRateLimiterWithOptions
+// reports these as an error).
 func NewWithConfig(config Config) *Arcis {
 	s := &Arcis{config: config}
 
@@ -865,11 +893,17 @@ func NewWithConfig(config Config) *Arcis {
 	}
 
 	if config.RateLimit {
-		if config.RateLimitStore != nil {
-			s.rateLimiter = NewRateLimiterWithStore(config.RateLimitMax, config.RateLimitWindow, config.RateLimitStore)
-		} else {
-			s.rateLimiter = NewRateLimiter(config.RateLimitMax, config.RateLimitWindow)
+		rateLimiter, err := NewRateLimiterWithOptions(RateLimiterOptions{
+			Max:            config.RateLimitMax,
+			Window:         config.RateLimitWindow,
+			Store:          config.RateLimitStore,
+			TrustedProxies: config.TrustedProxies,
+			OnStoreError:   config.RateLimitOnStoreError,
+		})
+		if err != nil {
+			panic(err.Error())
 		}
+		s.rateLimiter = rateLimiter
 		if config.RateLimitSkip != nil {
 			s.rateLimiter.SetSkipFunc(config.RateLimitSkip)
 		}

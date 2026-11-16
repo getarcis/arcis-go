@@ -16,6 +16,19 @@ jobs:
       fail-fast: false
       matrix:
         go-version: ["1.25.x", "1.27.x"]
+    # Real Redis for the store atomicity tests (stores/redis_integration_test.go).
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +46,20 @@ jobs:
   go-quality:
     name: Vet, format, and race
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    # Real Redis for the store atomicity tests (stores/redis_integration_test.go).
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
 
@@ -58,7 +84,7 @@ jobs:
         run: go vet ./...
 
       - name: go test (with race detector)
-        run: go test ./... -race -count=1 -timeout 5m
+        run: go test ./... -race -count=1 -timeout 12m
 
   conformance:
     name: Real-server conformance
@@ -137,6 +163,7 @@ jobs:
           }
           check spec/TEST_VECTORS.json spec/TEST_VECTORS.json
           check spec/html-sanitizer-vectors.json spec/html-sanitizer-vectors.json
+          check spec/client-ip-vectors.json spec/client-ip-vectors.json
           check sanitizers/data/patterns.json packages/core/patterns.json
           check middleware/data/bot_patterns.json packages/core/bot-patterns.json
           exit $rc

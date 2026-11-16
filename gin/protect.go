@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	arcis "github.com/getarcis/arcis-go"
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // improvements.md §1.4 (Go variant) — composite protect factories for Gin.
@@ -35,24 +36,6 @@ import (
 // adapter.
 type ProtectOptions = arcis.ProtectOptions
 
-// protectClientIP returns the request client IP. Honors X-Forwarded-For
-// (first hop) per the documented contract, then falls back to gin's
-// native ClientIP() (which itself consults the trusted-proxy chain and
-// RemoteAddr). Matching the Node reference's left-most X-Forwarded-For
-// behavior keeps the correlation key consistent across SDKs.
-func protectClientIP(c *gin.Context) string {
-	if xff := c.GetHeader("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			if first := strings.TrimSpace(xff[:i]); first != "" {
-				return first
-			}
-		} else if first := strings.TrimSpace(xff); first != "" {
-			return first
-		}
-	}
-	return c.ClientIP()
-}
-
 // protectUsername reads the JSON request body, pulls the configured
 // username field, and restores the body stream.
 //
@@ -75,10 +58,13 @@ func protectUsername(c *gin.Context, field string) string {
 	return arcis.ExtractUsername(raw, field)
 }
 
-// protect builds the shared Gin middleware for a given vector tag.
+// protect builds the shared Gin middleware for a given vector tag. The client
+// IP comes from the socket peer and X-Forwarded-For entries added by
+// opts.TrustedProxies, never from gin's c.ClientIP().
 func protect(vector string, opts ProtectOptions) gin.HandlerFunc {
+	clientIPs := utils.MustClientIPResolver(opts.TrustedProxies)
 	return func(c *gin.Context) {
-		ip := protectClientIP(c)
+		ip := clientIPs.ClientIP(c.Request)
 		username := protectUsername(c, optsUsernameField(opts))
 		route := c.FullPath()
 		if route == "" {

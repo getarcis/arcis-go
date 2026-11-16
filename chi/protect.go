@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	arcis "github.com/getarcis/arcis-go"
-	"github.com/getarcis/arcis-go/pipeline"
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // improvements.md §1.4 (Go variant) — composite protect factories for chi
@@ -33,14 +33,6 @@ import (
 // ProtectOptions configures the chi protect factories. Aliased to the
 // shared arcis.ProtectOptions so one config struct works across adapters.
 type ProtectOptions = arcis.ProtectOptions
-
-// protectClientIP returns the request client IP. Honors X-Forwarded-For
-// (first hop) per the documented contract, then falls back to the existing
-// clientIP helper (X-Real-IP then the host portion of RemoteAddr). clientIP
-// already takes the first XFF hop, so this delegates straight to it.
-func protectClientIP(r *http.Request) string {
-	return pipeline.ClientIP(r)
-}
 
 // protectUsername reads the JSON request body, pulls the configured
 // username field, and restores the body stream.
@@ -70,11 +62,14 @@ func protectUsernameField(opts ProtectOptions) string {
 	return "username"
 }
 
-// protect builds the shared stdlib middleware for a given vector tag.
+// protect builds the shared stdlib middleware for a given vector tag. The
+// client IP comes from the socket peer and X-Forwarded-For entries added by
+// opts.TrustedProxies.
 func protect(vector string, opts ProtectOptions) func(http.Handler) http.Handler {
+	clientIPs := utils.MustClientIPResolver(opts.TrustedProxies)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ip := protectClientIP(r)
+			ip := clientIPs.ClientIP(r)
 			username := protectUsername(r, protectUsernameField(opts))
 			decision := arcis.ResolveProtect(opts, vector, ip, r.URL.Path, r.Method, username)
 			if decision.Block {

@@ -55,6 +55,7 @@ import (
 	arcis "github.com/getarcis/arcis-go"
 	"github.com/getarcis/arcis-go/intelligence"
 	"github.com/getarcis/arcis-go/telemetry"
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // scanFiberCtxForThreats peeks at JSON body, query params, and URL path
@@ -149,6 +150,18 @@ type Config struct {
 	RateLimitWindow time.Duration
 	RateLimitSkip   func(*fiber.Ctx) bool
 	RateLimitStore  arcis.RateLimitStore // Optional external store (e.g. Redis)
+	// RateLimitOnStoreError receives store errors (the request is allowed),
+	// at most once per window. Nil logs through the standard log package.
+	RateLimitOnStoreError func(error)
+
+	// TrustedProxies lists the proxy IPs and CIDR ranges whose
+	// X-Forwarded-For entries are believed when resolving the client IP
+	// for rate limiting, telemetry and IP reputation. The peer is the
+	// connection address; fiber's c.IP() and ProxyHeader are not used. Nil
+	// uses the default set (loopback, link-local, private and unique-local
+	// ranges); an empty non-nil slice trusts nothing. An invalid entry makes
+	// MiddlewareWithConfig panic.
+	TrustedProxies []string
 
 	// Bot UA classification (v1.7 W1). When Bot is true the middleware
 	// classifies the User-Agent and denies categories in BotDeny with 403.
@@ -225,7 +238,7 @@ type Config struct {
 	Telemetry *telemetry.Client
 
 	// Intelligence, if non-nil, enables opt-in cloud IP reputation. On each
-	// request the client IP (fiber's c.IP(), honoring TrustedProxies) is
+	// request the client IP (resolved with TrustedProxies) is
 	// looked up (cache-first, non-blocking); when the verdict severity is at
 	// or above IntelligenceBlockThreshold, the request is denied with 403.
 	// Nil = no IP-reputation work. A threshold of 0 (or omitted) is observe-only.
@@ -389,7 +402,56 @@ func registerInstance(inst *arcisInstance) {
 type RateLimitOption func(*rateLimitOpts)
 
 type rateLimitOpts struct {
-	telemetry *telemetry.Client
+	telemetry      *telemetry.Client
+	trustedProxies []string
+	onStoreError   func(error)
+}
+
+// WithTrustedProxies sets the proxy IPs and CIDR ranges whose
+// X-Forwarded-For entries a standalone rate-limit middleware believes; see
+// Config.TrustedProxies.
+func WithTrustedProxies(proxies []string) RateLimitOption {
+	return func(o *rateLimitOpts) { o.trustedProxies = proxies }
+}
+
+// WithStoreErrorHandler sets the function that receives store errors (at most
+// once per window) for a standalone rate-limit middleware. Requests are
+// allowed while the store fails.
+func WithStoreErrorHandler(fn func(error)) RateLimitOption {
+	return func(o *rateLimitOpts) { o.onStoreError = fn }
+}
+
+// newRateLimiter builds a limiter, panicking on invalid configuration because
+// the middleware constructors cannot return an error.
+func newRateLimiter(opts arcis.RateLimiterOptions) *arcis.RateLimiter {
+	limiter, err := arcis.NewRateLimiterWithOptions(opts)
+	if err != nil {
+		panic(err.Error())
+	}
+	return limiter
+}
+
+// peerAddr returns the connection address of c ("ip:port"), never a header.
+func peerAddr(c *fiber.Ctx) string {
+	return c.Context().RemoteAddr().String()
+}
+
+// forwardedFor returns copies of the X-Forwarded-For header values. The copies
+// matter: fasthttp reuses the request buffers once the handler returns.
+func forwardedFor(c *fiber.Ctx) []string {
+	raw := c.Request().Header.PeekAll(fiber.HeaderXForwardedFor)
+	values := make([]string, len(raw))
+	for i, v := range raw {
+		values[i] = string(v)
+	}
+	return values
+}
+
+// clientIP resolves the client IP of c. The result is a fresh string that
+// does not alias fasthttp's reusable buffers, so it is safe to keep as a map
+// key or hand to background work.
+func clientIP(clientIPs *utils.ClientIPResolver, c *fiber.Ctx) string {
+	return clientIPs.Resolve(peerAddr(c), forwardedFor(c)...)
 }
 
 // WithTelemetry returns a RateLimitOption that attaches a telemetry
@@ -405,7 +467,7 @@ func WithTelemetry(tc *telemetry.Client) RateLimitOption {
 	return func(o *rateLimitOpts) { o.telemetry = tc }
 }
 
-func emitRateLimitDeny(tc *telemetry.Client, c *fiber.Ctx, start time.Time) {
+func emitRateLimitDeny(tc *telemetry.Client, c *fiber.Ctx, ip string, start time.Time) {
 	if tc == nil {
 		return
 	}
@@ -415,7 +477,7 @@ func emitRateLimitDeny(tc *telemetry.Client, c *fiber.Ctx, start time.Time) {
 	}
 	tc.Send(telemetry.Event{
 		Ts:        time.Now().UTC().Format(time.RFC3339),
-		IP:        c.IP(),
+		IP:        ip,
 		Method:    c.Method(),
 		Path:      c.Path(),
 		Decision:  telemetry.DecisionDeny,
@@ -459,14 +521,17 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 
 	sanitizer := arcis.NewSanitizer(arcisConfig)
 	instance := &arcisInstance{}
+	clientIPs := utils.MustClientIPResolver(config.TrustedProxies)
 
 	var rateLimiter *arcis.RateLimiter
 	if config.RateLimit {
-		if config.RateLimitStore != nil {
-			rateLimiter = arcis.NewRateLimiterWithStore(config.RateLimitMax, config.RateLimitWindow, config.RateLimitStore)
-		} else {
-			rateLimiter = arcis.NewRateLimiter(config.RateLimitMax, config.RateLimitWindow)
-		}
+		rateLimiter = newRateLimiter(arcis.RateLimiterOptions{
+			Max:            config.RateLimitMax,
+			Window:         config.RateLimitWindow,
+			Store:          config.RateLimitStore,
+			TrustedProxies: config.TrustedProxies,
+			OnStoreError:   config.RateLimitOnStoreError,
+		})
 		instance.rateLimiter = rateLimiter
 	}
 
@@ -525,7 +590,7 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 				}
 				config.Telemetry.Send(telemetry.Event{
 					Ts:             time.Now().UTC().Format(time.RFC3339),
-					IP:             c.IP(),
+					IP:             clientIP(clientIPs, c),
 					Method:         c.Method(),
 					Path:           c.Path(),
 					Decision:       decision,
@@ -583,13 +648,11 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 		// Cloud IP reputation (opt-in). After forwarded-header inspection,
 		// before scanner/bot/rate-limit so a known-bad IP is blocked before
 		// consuming quota. Cache-first + non-blocking; fails open. Dry-run
-		// observes cached decisions without returning an Arcis response. Uses
-		// fiber's c.IP() (honors TrustedProxies).
+		// observes cached decisions without returning an Arcis response. The
+		// resolved IP never aliases fasthttp buffers, so the client's
+		// background cache-miss refresh can keep it.
 		if config.Intelligence != nil {
-			// Copy c.IP(): it aliases a pooled fasthttp buffer that is recycled
-			// once the handler returns, but the client's cache-miss refresh runs
-			// in a background goroutine that outlives the request.
-			ip := strings.Clone(c.IP())
+			ip := clientIP(clientIPs, c)
 			rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, ip)
 			if block {
 				if config.DryRun {
@@ -688,11 +751,11 @@ func MiddlewareWithConfig(config Config) fiber.Handler {
 		skipRateLimit := config.RateLimitSkip != nil && config.RateLimitSkip(c)
 
 		if !skipRateLimit && rateLimiter != nil {
-			// Use CheckKey directly with fiber's c.IP() so we don't
-			// have to build a synthetic *http.Request just for the
-			// IP read. c.IP() honours fiber's TrustedProxies config
-			// when configured.
-			result := rateLimiter.CheckKey(c.IP())
+			// fiber has no *http.Request, so resolve the client from the
+			// connection address and trusted X-Forwarded-For entries here.
+			// c.IP() is not used: with ProxyHeader set it believes any peer
+			// and returns a string aliasing a reused fasthttp buffer.
+			result := rateLimiter.CheckKey(utils.RateLimitKey(clientIP(clientIPs, c)))
 
 			c.Set("X-RateLimit-Limit", strconv.Itoa(result.Limit))
 			c.Set("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
@@ -873,11 +936,13 @@ const sanitizerLocalKey = "arcis_sanitizer"
 // BruteForce returns standalone brute-force protection middleware for login /
 // password-reset routes. Build the limiter once, keep the reference for
 // b.Reset(key) after a successful auth, and b.Close() on shutdown. Fiber is
-// fasthttp-based (no net/http request), so the key is c.IP(); cfg.KeyFunc /
-// cfg.Skip (which take *http.Request) are not consulted here.
+// fasthttp-based (no net/http request), so the key is the client resolved
+// from the connection address with the limiter's TrustedProxies
+// (b.CheckPeer); cfg.KeyFunc / cfg.Skip (which take *http.Request) are not
+// consulted here.
 func BruteForce(b *arcis.BruteForce) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		res := b.CheckKey(c.IP())
+		res := b.CheckPeer(peerAddr(c), forwardedFor(c))
 		if !res.Allowed {
 			retryAfter := int(res.RetryAfter.Seconds())
 			if retryAfter < 1 {
@@ -934,23 +999,37 @@ func GetSanitizer(c *fiber.Ctx) *arcis.Sanitizer {
 // RateLimit returns a standalone rate-limit middleware. Optional
 // WithTelemetry attaches a telemetry client that emits on 429.
 func RateLimit(max int, window time.Duration, opts ...RateLimitOption) fiber.Handler {
-	return rateLimitWithLimiter(arcis.NewRateLimiter(max, window), opts...)
+	return RateLimitWithStore(max, window, nil, opts...)
 }
 
 // RateLimitWithStore returns a rate-limit middleware backed by an
-// external store (Redis, etc.).
+// external store (Redis, etc.). A nil store uses the in-memory store.
 func RateLimitWithStore(max int, window time.Duration, store arcis.RateLimitStore, opts ...RateLimitOption) fiber.Handler {
-	return rateLimitWithLimiter(arcis.NewRateLimiterWithStore(max, window, store), opts...)
+	return rateLimitHandler(max, window, nil, store, opts...)
 }
 
 // RateLimitWithSkip returns a rate-limit middleware that skips counting
 // requests for which `skip(c)` returns true (e.g., health checks).
 func RateLimitWithSkip(max int, window time.Duration, skip func(*fiber.Ctx) bool, opts ...RateLimitOption) fiber.Handler {
-	limiter := arcis.NewRateLimiter(max, window)
+	return rateLimitHandler(max, window, skip, nil, opts...)
+}
+
+// rateLimitHandler is the shared body of the standalone rate-limit
+// helpers: an optional skip function and an optional store (nil uses the
+// in-memory store).
+func rateLimitHandler(max int, window time.Duration, skip func(*fiber.Ctx) bool, store arcis.RateLimitStore, opts ...RateLimitOption) fiber.Handler {
 	options := &rateLimitOpts{}
 	for _, opt := range opts {
 		opt(options)
 	}
+	limiter := newRateLimiter(arcis.RateLimiterOptions{
+		Max:            max,
+		Window:         window,
+		Store:          store,
+		TrustedProxies: options.trustedProxies,
+		OnStoreError:   options.onStoreError,
+	})
+	clientIPs := utils.MustClientIPResolver(options.trustedProxies)
 	instance := &arcisInstance{rateLimiter: limiter}
 	registerInstance(instance)
 
@@ -959,41 +1038,13 @@ func RateLimitWithSkip(max int, window time.Duration, skip func(*fiber.Ctx) bool
 			return c.Next()
 		}
 		start := time.Now()
-		result := limiter.CheckKey(c.IP())
+		ip := clientIP(clientIPs, c)
+		result := limiter.CheckKey(utils.RateLimitKey(ip))
 		c.Set("X-RateLimit-Limit", strconv.Itoa(result.Limit))
 		c.Set("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
 		c.Set("X-RateLimit-Reset", strconv.Itoa(int(result.Reset.Seconds())))
 		if !result.Allowed {
-			emitRateLimitDeny(options.telemetry, c, start)
-			c.Set("Retry-After", strconv.Itoa(int(result.Reset.Seconds())))
-			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-				"error":      "Too many requests, please try again later.",
-				"retryAfter": int(result.Reset.Seconds()),
-			})
-		}
-		return c.Next()
-	}
-}
-
-// rateLimitWithLimiter is the shared body of RateLimit and
-// RateLimitWithStore so option-parsing and telemetry hookup stay in
-// one place.
-func rateLimitWithLimiter(limiter *arcis.RateLimiter, opts ...RateLimitOption) fiber.Handler {
-	options := &rateLimitOpts{}
-	for _, opt := range opts {
-		opt(options)
-	}
-	instance := &arcisInstance{rateLimiter: limiter}
-	registerInstance(instance)
-
-	return func(c *fiber.Ctx) error {
-		start := time.Now()
-		result := limiter.CheckKey(c.IP())
-		c.Set("X-RateLimit-Limit", strconv.Itoa(result.Limit))
-		c.Set("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
-		c.Set("X-RateLimit-Reset", strconv.Itoa(int(result.Reset.Seconds())))
-		if !result.Allowed {
-			emitRateLimitDeny(options.telemetry, c, start)
+			emitRateLimitDeny(options.telemetry, c, ip, start)
 			c.Set("Retry-After", strconv.Itoa(int(result.Reset.Seconds())))
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 				"error":      "Too many requests, please try again later.",

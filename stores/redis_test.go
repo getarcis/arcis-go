@@ -3,6 +3,7 @@ package stores
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,417 +11,176 @@ import (
 	"github.com/getarcis/arcis-go/core"
 )
 
-// mockRedis implements RedisClient for testing.
-type mockRedis struct {
-	mu   sync.Mutex
-	data map[string]string
-	ttls map[string]time.Time
-	fail bool // simulate Redis errors
+// fakeRedis emulates the store's Lua scripts in memory so the store logic can
+// be unit tested without a server. redis_integration_test.go runs the real
+// scripts against Redis.
+type fakeRedis struct {
+	mu      sync.Mutex
+	values  map[string]int64
+	expires map[string]time.Time
+	err     error
+	keys    []string
 }
 
-func newMockRedis() *mockRedis {
-	return &mockRedis{
-		data: make(map[string]string),
-		ttls: make(map[string]time.Time),
-	}
+func newFakeRedis() *fakeRedis {
+	return &fakeRedis{values: map[string]int64{}, expires: map[string]time.Time{}}
 }
 
-func (m *mockRedis) Get(_ context.Context, key string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.fail {
-		return "", errors.New("redis error")
+func (f *fakeRedis) Eval(_ context.Context, script string, keys []string, args ...interface{}) (interface{}, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
 	}
-	val, ok := m.data[key]
-	if !ok {
-		return "", errors.New("key not found")
+	if script == "return 1" {
+		return int64(1), nil
 	}
-	if exp, ok := m.ttls[key]; ok && time.Now().After(exp) {
-		delete(m.data, key)
-		delete(m.ttls, key)
-		return "", errors.New("key expired")
+	key := keys[0]
+	f.keys = append(f.keys, key)
+	if exp, ok := f.expires[key]; ok && !time.Now().Before(exp) {
+		delete(f.values, key)
+		delete(f.expires, key)
 	}
-	return val, nil
-}
-
-func (m *mockRedis) Set(_ context.Context, key string, value string, expiration time.Duration) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.fail {
-		return errors.New("redis error")
-	}
-	m.data[key] = value
-	if expiration > 0 {
-		m.ttls[key] = time.Now().Add(expiration)
-	}
-	return nil
-}
-
-func (m *mockRedis) Incr(_ context.Context, key string) (int64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.fail {
-		return 0, errors.New("redis error")
-	}
-	val, ok := m.data[key]
-	if !ok {
-		m.data[key] = "1"
-		return 1, nil
-	}
-	n := 0
-	for _, c := range val {
-		n = n*10 + int(c-'0')
-	}
-	n++
-	m.data[key] = itoa(n)
-	return int64(n), nil
-}
-
-func (m *mockRedis) Expire(_ context.Context, key string, expiration time.Duration) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.fail {
-		return errors.New("redis error")
-	}
-	m.ttls[key] = time.Now().Add(expiration)
-	return nil
-}
-
-func (m *mockRedis) Del(_ context.Context, key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.fail {
-		return errors.New("redis error")
-	}
-	delete(m.data, key)
-	delete(m.ttls, key)
-	return nil
-}
-
-func (m *mockRedis) TTL(_ context.Context, key string) (time.Duration, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.fail {
-		return 0, errors.New("redis error")
-	}
-	exp, ok := m.ttls[key]
-	if !ok {
-		return -1, nil
-	}
-	remaining := time.Until(exp)
-	if remaining <= 0 {
-		return -1, nil
-	}
-	return remaining, nil
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	digits := []byte{}
-	for n > 0 {
-		digits = append([]byte{byte('0' + n%10)}, digits...)
-		n /= 10
-	}
-	return string(digits)
-}
-
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
-func TestNewRedisRateLimitStore_Defaults(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	if store.prefix != "arcis:rl:" {
-		t.Errorf("Expected default prefix, got %q", store.prefix)
-	}
-	if store.window != 60*time.Second {
-		t.Errorf("Expected 60s window, got %v", store.window)
-	}
-}
-
-func TestNewRedisRateLimitStore_CustomOptions(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, &RedisStoreOptions{
-		Prefix:   "myapp:",
-		WindowMs: 30000,
-	})
-
-	if store.prefix != "myapp:" {
-		t.Errorf("Expected custom prefix, got %q", store.prefix)
-	}
-	if store.window != 30*time.Second {
-		t.Errorf("Expected 30s window, got %v", store.window)
-	}
-}
-
-func TestNewRedisRateLimitStore_DurationOverridesMs(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, &RedisStoreOptions{
-		WindowMs: 30000,
-		Window:   2 * time.Minute,
-	})
-
-	if store.window != 2*time.Minute {
-		t.Errorf("Duration should override WindowMs, got %v", store.window)
-	}
-}
-
-func TestRedisStore_Increment_FirstCall(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	count := store.Increment("user1")
-	if count != 1 {
-		t.Errorf("First increment should be 1, got %d", count)
-	}
-}
-
-func TestRedisStore_Increment_Multiple(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	store.Increment("user1")
-	store.Increment("user1")
-	count := store.Increment("user1")
-
-	if count != 3 {
-		t.Errorf("Expected count 3, got %d", count)
-	}
-}
-
-func TestRedisStore_Increment_OutageClimbsViaFallback(t *testing.T) {
-	// During a Redis outage the counter must keep climbing via the in-memory
-	// fallback so the limit still trips. The prior behavior (returning 1 on
-	// every failed Increment) was a pure bypass: every request looked like the
-	// first and the limiter never tripped. This is the cross-SDK parity fix
-	// (Node/Python fall back to an in-memory store on a store error).
-	mock := newMockRedis()
-	mock.fail = true
-	store := NewRedisRateLimitStore(mock, nil)
-
-	if c := store.Increment("user1"); c != 1 {
-		t.Errorf("first increment during outage should be 1, got %d", c)
-	}
-	if c := store.Increment("user1"); c != 2 {
-		t.Errorf("second increment during outage should be 2 (not a bypass), got %d", c)
-	}
-	if c := store.Increment("user1"); c != 3 {
-		t.Errorf("third increment during outage should be 3, got %d", c)
-	}
-	// A different key is independent.
-	if c := store.Increment("user2"); c != 1 {
-		t.Errorf("independent key should start at 1, got %d", c)
-	}
-}
-
-func TestRedisStore_Get_Exists(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	store.Increment("user1")
-	store.Increment("user1")
-	store.Increment("user1")
-
-	entry := store.Get("user1")
-	if entry == nil {
-		t.Fatal("Expected non-nil entry")
-	}
-	if entry.Count != 3 {
-		t.Errorf("Expected count 3, got %d", entry.Count)
-	}
-	if entry.ResetTime.Before(time.Now()) {
-		t.Error("ResetTime should be in the future")
-	}
-}
-
-func TestRedisStore_Get_NotExists(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	entry := store.Get("nonexistent")
-	if entry != nil {
-		t.Error("Expected nil for non-existent key")
-	}
-}
-
-func TestRedisStore_Get_OutageEmptyFallbackIsNil(t *testing.T) {
-	// During an outage, a key never seen by the fallback returns nil. This
-	// preserves fail-open-on-missing-key: the caller then Sets {Count:1}, which
-	// the fallback records, and subsequent requests climb (see the test below).
-	mock := newMockRedis()
-	mock.fail = true
-	store := NewRedisRateLimitStore(mock, nil)
-
-	if entry := store.Get("user1"); entry != nil {
-		t.Error("Expected nil for a key the fallback has never seen during an outage")
-	}
-}
-
-func TestRedisStore_OutageMaintainsRateLimit(t *testing.T) {
-	// End-to-end outage flow mirroring how the RateLimiter drives the store:
-	// Get -> (Set if nil) -> Increment. With Redis down the count must persist
-	// and climb across requests so a limiter with max=N actually trips, rather
-	// than every request being treated as the first (pure bypass).
-	mock := newMockRedis()
-	mock.fail = true
-	store := NewRedisRateLimitStore(mock, nil)
-
-	const maxRequests = 3
-	tripped := false
-	for i := 1; i <= 6; i++ {
-		entry := store.Get("client")
-		var count int
-		if entry == nil {
-			store.Set("client", &core.RateLimitEntry{Count: 1, ResetTime: time.Now().Add(time.Minute)})
-			count = 1
-		} else {
-			count = store.Increment("client")
+	_, exists := f.values[key]
+	pttl := func() int64 {
+		if !exists {
+			return -2
 		}
-		if count > maxRequests {
-			tripped = true
+		return time.Until(f.expires[key]).Milliseconds()
+	}
+	switch script {
+	case incrementScript:
+		f.values[key]++
+		if !exists {
+			f.expires[key] = time.Now().Add(time.Duration(args[0].(int64)) * time.Millisecond)
+			exists = true
+		}
+		return []interface{}{f.values[key], pttl()}, nil
+	case decrementScript:
+		if f.values[key] > 0 {
+			f.values[key]--
+		}
+		return f.values[key], nil
+	case getScript:
+		if !exists {
+			return []interface{}{int64(0), int64(-2)}, nil
+		}
+		return []interface{}{f.values[key], pttl()}, nil
+	case resetScript:
+		delete(f.values, key)
+		delete(f.expires, key)
+		return int64(1), nil
+	}
+	return nil, errors.New("unknown script")
+}
+
+var _ core.RateLimitStore = (*RedisRateLimitStore)(nil)
+var _ core.RateLimitStoreGetter = (*RedisRateLimitStore)(nil)
+
+func TestRedisStore_DefaultAndCustomPrefix(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeRedis()
+	NewRedisRateLimitStore(fake, nil).Increment(ctx, "k", time.Minute)
+	NewRedisRateLimitStore(fake, &RedisStoreOptions{Prefix: "custom:"}).Increment(ctx, "k", time.Minute)
+	if got := strings.Join(fake.keys, ","); got != "arcis:rl:k,custom:k" {
+		t.Fatalf("keys %q", got)
+	}
+}
+
+func TestRedisStore_IncrementReturnsHitsAndReset(t *testing.T) {
+	s := NewRedisRateLimitStore(newFakeRedis(), nil)
+	ctx := context.Background()
+	for want := 1; want <= 3; want++ {
+		e, err := s.Increment(ctx, "k", time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e.Count != want {
+			t.Fatalf("count %d, want %d", e.Count, want)
+		}
+		if until := time.Until(e.ResetTime); until <= 0 || until > time.Minute {
+			t.Fatalf("reset in %v, want within one minute", until)
 		}
 	}
-	if !tripped {
-		t.Error("rate limit never tripped during a Redis outage — protection was bypassed")
+}
+
+func TestRedisStore_RejectsSubMillisecondWindow(t *testing.T) {
+	s := NewRedisRateLimitStore(newFakeRedis(), nil)
+	if _, err := s.Increment(context.Background(), "k", time.Microsecond); err == nil {
+		t.Fatal("expected an error for a window under 1ms")
 	}
 }
 
-func TestRedisStore_Set(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
+func TestRedisStore_ErrorsAreReturnedNotSwallowed(t *testing.T) {
+	fake := newFakeRedis()
+	fake.err = errors.New("connection refused")
+	s := NewRedisRateLimitStore(fake, nil)
+	ctx := context.Background()
 
-	entry := &core.RateLimitEntry{
-		Count:     5,
-		ResetTime: time.Now().Add(30 * time.Second),
+	if _, err := s.Increment(ctx, "k", time.Minute); err == nil || !errors.Is(err, fake.err) {
+		t.Errorf("Increment error %v, want wrapped %v", err, fake.err)
 	}
-	store.Set("user1", entry)
-
-	got := store.Get("user1")
-	if got == nil {
-		t.Fatal("Expected non-nil after Set")
+	if err := s.Decrement(ctx, "k"); err == nil {
+		t.Error("Decrement swallowed the error")
 	}
-	if got.Count != 5 {
-		t.Errorf("Expected count 5, got %d", got.Count)
+	if err := s.ResetKey(ctx, "k"); err == nil {
+		t.Error("ResetKey swallowed the error")
 	}
-}
-
-func TestRedisStore_Set_ExpiredResetTime(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	// Set with past reset time — should use window as fallback TTL
-	entry := &core.RateLimitEntry{
-		Count:     5,
-		ResetTime: time.Now().Add(-1 * time.Second),
+	if _, _, err := s.Get(ctx, "k"); err == nil {
+		t.Error("Get swallowed the error")
 	}
-	store.Set("user1", entry)
-
-	got := store.Get("user1")
-	if got == nil {
-		t.Fatal("Expected non-nil — fallback TTL should keep it alive")
+	if err := s.Ping(); err == nil {
+		t.Error("Ping swallowed the error")
 	}
 }
 
-func TestRedisStore_Reset(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	store.Increment("user1")
-	err := store.Reset("user1")
-	if err != nil {
-		t.Errorf("Reset failed: %v", err)
-	}
-
-	entry := store.Get("user1")
-	if entry != nil {
-		t.Error("Expected nil after reset")
+func TestRedisStore_UnexpectedReplyIsAnError(t *testing.T) {
+	s := NewRedisRateLimitStore(replyClient{reply: "OK"}, nil)
+	if _, err := s.Increment(context.Background(), "k", time.Minute); err == nil {
+		t.Fatal("expected an error for a malformed reply")
 	}
 }
 
-func TestRedisStore_Cleanup_NoOp(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
+type replyClient struct{ reply interface{} }
 
-	// Should not panic
-	store.Cleanup()
+func (c replyClient) Eval(context.Context, string, []string, ...interface{}) (interface{}, error) {
+	return c.reply, nil
 }
 
-func TestRedisStore_Close_NoOp(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	err := store.Close()
-	if err != nil {
-		t.Errorf("Close should not error: %v", err)
+func TestRedisStore_AcceptsStringAndByteIntegers(t *testing.T) {
+	s := NewRedisRateLimitStore(replyClient{reply: []interface{}{"4", []byte("1500")}}, nil)
+	e, err := s.Increment(context.Background(), "k", time.Minute)
+	if err != nil || e.Count != 4 {
+		t.Fatalf("got %+v, %v", e, err)
 	}
 }
 
-func TestRedisStore_Ping_Success(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	err := store.Ping()
-	if err != nil {
-		t.Errorf("Ping should succeed: %v", err)
+func TestRedisStore_DecrementGetReset(t *testing.T) {
+	s := NewRedisRateLimitStore(newFakeRedis(), nil)
+	ctx := context.Background()
+	s.Increment(ctx, "k", time.Minute)
+	s.Increment(ctx, "k", time.Minute)
+	if err := s.Decrement(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	e, ok, err := s.Get(ctx, "k")
+	if err != nil || !ok || e.Count != 1 {
+		t.Fatalf("Get = %+v, %v, %v; want count 1", e, ok, err)
+	}
+	if err := s.ResetKey(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.Get(ctx, "k"); ok {
+		t.Fatal("key present after ResetKey")
 	}
 }
 
-func TestRedisStore_Ping_Failure(t *testing.T) {
-	mock := newMockRedis()
-	mock.fail = true
-	store := NewRedisRateLimitStore(mock, nil)
-
-	err := store.Ping()
-	if err == nil {
-		t.Error("Ping should fail when Redis is down")
+func TestRedisStore_PingAndClose(t *testing.T) {
+	s := NewRedisRateLimitStore(newFakeRedis(), nil)
+	if err := s.Ping(); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestRedisStore_ImplementsInterface(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	// Compile-time check
-	var _ core.RateLimitStore = store
-}
-
-func TestRedisStore_DifferentKeys(t *testing.T) {
-	mock := newMockRedis()
-	store := NewRedisRateLimitStore(mock, nil)
-
-	store.Increment("user1")
-	store.Increment("user1")
-	store.Increment("user2")
-
-	e1 := store.Get("user1")
-	e2 := store.Get("user2")
-
-	if e1 == nil || e1.Count != 2 {
-		t.Errorf("user1 count should be 2, got %v", e1)
-	}
-	if e2 == nil || e2.Count != 1 {
-		t.Errorf("user2 count should be 1, got %v", e2)
-	}
-}
-
-func TestRedisStore_PrefixIsolation(t *testing.T) {
-	mock := newMockRedis()
-	store1 := NewRedisRateLimitStore(mock, &RedisStoreOptions{Prefix: "app1:"})
-	store2 := NewRedisRateLimitStore(mock, &RedisStoreOptions{Prefix: "app2:"})
-
-	store1.Increment("user1")
-	store1.Increment("user1")
-	store2.Increment("user1")
-
-	e1 := store1.Get("user1")
-	e2 := store2.Get("user1")
-
-	if e1 == nil || e1.Count != 2 {
-		t.Errorf("app1:user1 count should be 2, got %v", e1)
-	}
-	if e2 == nil || e2.Count != 1 {
-		t.Errorf("app2:user1 count should be 1, got %v", e2)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

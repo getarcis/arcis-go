@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -34,6 +35,16 @@ type Config struct {
 	RateLimitWindow time.Duration
 	RateLimitSkip   func(*http.Request) bool // Skip rate limiting for certain requests
 	RateLimitStore  RateLimitStore           // Optional external store (e.g. Redis)
+	// RateLimitOnStoreError receives store errors (the request is allowed),
+	// at most once per window. Nil logs through the standard log package.
+	RateLimitOnStoreError func(error)
+
+	// TrustedProxies lists the proxy IPs and CIDR ranges whose
+	// X-Forwarded-For entries are believed when resolving the client IP
+	// (spec/API_SPEC.md "Client IP resolution"). Nil uses the default set
+	// (loopback, link-local, private and unique-local ranges); an empty
+	// non-nil slice trusts nothing, so the socket peer is always the client.
+	TrustedProxies []string
 
 	// Security headers options
 	Headers           bool
@@ -103,21 +114,36 @@ type RateLimitResult struct {
 	Reset     time.Duration
 }
 
-// RateLimitEntry holds the data for a single rate limit record.
-// Used by RateLimitStore implementations.
+// RateLimitEntry is a key's counter state: the hits recorded in the current
+// window and the time the window ends.
 type RateLimitEntry struct {
 	Count     int
 	ResetTime time.Time
 }
 
-// RateLimitStore defines the interface for pluggable rate limit store backends.
-// The default implementation is an in-memory store. Implement this interface
-// to use a distributed backend such as Redis for multi-instance deployments.
+// RateLimitStore is the counter backend behind RateLimiter
+// (spec/API_SPEC.md "Store contract and counting"). The default is the
+// in-memory stores.MemoryStore; stores.RedisRateLimitStore shares counters
+// across instances.
+//
+// Implementations must not swallow their own errors: the limiter fails open
+// and reports them.
 type RateLimitStore interface {
-	Get(key string) *RateLimitEntry
-	Set(key string, entry *RateLimitEntry)
-	Increment(key string) int
-	Cleanup()
+	// Increment records one hit for key in a single atomic operation and
+	// returns the total hits in the current window and when it resets. The
+	// first hit of a window creates the counter with its expiry set to
+	// window from now; a counter whose window has ended starts again at 1.
+	Increment(ctx context.Context, key string, window time.Duration) (RateLimitEntry, error)
+	// Decrement removes one hit from key, never going below zero.
+	Decrement(ctx context.Context, key string) error
+	// ResetKey deletes key's counter.
+	ResetKey(ctx context.Context, key string) error
+}
+
+// RateLimitStoreGetter is optionally implemented by stores that can read a
+// counter without changing it. ok is false when key has no live window.
+type RateLimitStoreGetter interface {
+	Get(ctx context.Context, key string) (entry RateLimitEntry, ok bool, err error)
 }
 
 // InputTooLargeError is returned when input exceeds the maximum size.

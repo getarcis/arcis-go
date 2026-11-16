@@ -82,6 +82,7 @@ import (
 	"github.com/getarcis/arcis-go/pipeline"
 	"github.com/getarcis/arcis-go/sanitizers"
 	"github.com/getarcis/arcis-go/telemetry"
+	"github.com/getarcis/arcis-go/utils"
 )
 
 // Config holds Arcis middleware configuration for Echo.
@@ -115,6 +116,18 @@ type Config struct {
 	RateLimitWindow time.Duration
 	RateLimitSkip   func(echo.Context) bool
 	RateLimitStore  arcis.RateLimitStore // Optional external store (e.g. Redis)
+	// RateLimitOnStoreError receives store errors (the request is allowed),
+	// at most once per window. Nil logs through the standard log package.
+	RateLimitOnStoreError func(error)
+
+	// TrustedProxies lists the proxy IPs and CIDR ranges whose
+	// X-Forwarded-For entries are believed when resolving the client IP
+	// for rate limiting, telemetry and IP reputation. Nil uses the default
+	// set (loopback, link-local, private and unique-local ranges); an empty
+	// non-nil slice trusts nothing. Echo's c.RealIP() is not used, since it
+	// believes forwarded headers from any peer unless an IPExtractor is set.
+	// An invalid entry makes MiddlewareWithConfig panic.
+	TrustedProxies []string
 
 	// Bot UA classification (v1.7 W1). When Bot is true the middleware
 	// classifies the User-Agent and denies categories in BotDeny with 403.
@@ -371,7 +384,33 @@ func registerInstance(instance *arcisInstance) {
 type RateLimitOption func(*rateLimitOpts)
 
 type rateLimitOpts struct {
-	telemetry *telemetry.Client
+	telemetry      *telemetry.Client
+	trustedProxies []string
+	onStoreError   func(error)
+}
+
+// WithTrustedProxies sets the proxy IPs and CIDR ranges whose
+// X-Forwarded-For entries a standalone rate-limit middleware believes; see
+// Config.TrustedProxies.
+func WithTrustedProxies(proxies []string) RateLimitOption {
+	return func(o *rateLimitOpts) { o.trustedProxies = proxies }
+}
+
+// WithStoreErrorHandler sets the function that receives store errors (at most
+// once per window) for a standalone rate-limit middleware. Requests are
+// allowed while the store fails.
+func WithStoreErrorHandler(fn func(error)) RateLimitOption {
+	return func(o *rateLimitOpts) { o.onStoreError = fn }
+}
+
+// newRateLimiter builds a limiter, panicking on invalid configuration because
+// the middleware constructors cannot return an error.
+func newRateLimiter(opts arcis.RateLimiterOptions) *arcis.RateLimiter {
+	limiter, err := arcis.NewRateLimiterWithOptions(opts)
+	if err != nil {
+		panic(err.Error())
+	}
+	return limiter
 }
 
 // WithTelemetry returns a RateLimitOption that attaches a telemetry
@@ -390,7 +429,7 @@ func WithTelemetry(tc *telemetry.Client) RateLimitOption {
 // emitRateLimitDeny ships one TelemetryEvent for a 429 from a standalone
 // rate-limit helper. Callers register a deferred call so the latency
 // includes the JSON write, matching MiddlewareWithConfig's measurement.
-func emitRateLimitDeny(tc *telemetry.Client, c echo.Context, start time.Time) {
+func emitRateLimitDeny(tc *telemetry.Client, c echo.Context, clientIPs *utils.ClientIPResolver, start time.Time) {
 	if tc == nil {
 		return
 	}
@@ -400,7 +439,7 @@ func emitRateLimitDeny(tc *telemetry.Client, c echo.Context, start time.Time) {
 	}
 	tc.Send(telemetry.Event{
 		Ts:        time.Now().UTC().Format(time.RFC3339),
-		IP:        c.RealIP(),
+		IP:        clientIPs.ClientIP(c.Request()),
 		Method:    c.Request().Method,
 		Path:      c.Request().URL.Path,
 		Decision:  telemetry.DecisionDeny,
@@ -445,14 +484,17 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 
 	sanitizer := arcis.NewSanitizer(arcisConfig)
 	instance := &arcisInstance{}
+	clientIPs := utils.MustClientIPResolver(config.TrustedProxies)
 
 	var rateLimiter *arcis.RateLimiter
 	if config.RateLimit {
-		if config.RateLimitStore != nil {
-			rateLimiter = arcis.NewRateLimiterWithStore(config.RateLimitMax, config.RateLimitWindow, config.RateLimitStore)
-		} else {
-			rateLimiter = arcis.NewRateLimiter(config.RateLimitMax, config.RateLimitWindow)
-		}
+		rateLimiter = newRateLimiter(arcis.RateLimiterOptions{
+			Max:            config.RateLimitMax,
+			Window:         config.RateLimitWindow,
+			Store:          config.RateLimitStore,
+			TrustedProxies: config.TrustedProxies,
+			OnStoreError:   config.RateLimitOnStoreError,
+		})
 		instance.rateLimiter = rateLimiter
 	}
 
@@ -517,7 +559,7 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 					}
 					config.Telemetry.Send(telemetry.Event{
 						Ts:             time.Now().UTC().Format(time.RFC3339),
-						IP:             c.RealIP(),
+						IP:             clientIPs.ClientIP(c.Request()),
 						Method:         c.Request().Method,
 						Path:           c.Request().URL.Path,
 						Decision:       decision,
@@ -577,7 +619,7 @@ func MiddlewareWithConfig(config Config) echo.MiddlewareFunc {
 			// an unreachable service fails open. Dry-run observes cached decisions
 			// without returning an Arcis response.
 			if config.Intelligence != nil {
-				rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, c.RealIP())
+				rep, block := intelligence.ShouldBlock(config.Intelligence, config.IntelligenceBlockThreshold, clientIPs.ClientIP(c.Request()))
 				if block {
 					if config.DryRun {
 						decision = telemetry.DecisionWouldDeny
@@ -879,7 +921,14 @@ func RateLimitWithStore(max int, window time.Duration, store arcis.RateLimitStor
 		opt(&o)
 	}
 
-	limiter := arcis.NewRateLimiterWithStore(max, window, store)
+	limiter := newRateLimiter(arcis.RateLimiterOptions{
+		Max:            max,
+		Window:         window,
+		Store:          store,
+		TrustedProxies: o.trustedProxies,
+		OnStoreError:   o.onStoreError,
+	})
+	clientIPs := utils.MustClientIPResolver(o.trustedProxies)
 	instance := &arcisInstance{rateLimiter: limiter}
 	registerInstance(instance)
 
@@ -890,7 +939,7 @@ func RateLimitWithStore(max int, window time.Duration, store arcis.RateLimitStor
 			if o.telemetry != nil {
 				defer func() {
 					if didDeny {
-						emitRateLimitDeny(o.telemetry, c, start)
+						emitRateLimitDeny(o.telemetry, c, clientIPs, start)
 					}
 				}()
 			}
@@ -923,7 +972,13 @@ func RateLimitWithSkip(max int, window time.Duration, skip func(echo.Context) bo
 		opt(&o)
 	}
 
-	limiter := arcis.NewRateLimiter(max, window)
+	limiter := newRateLimiter(arcis.RateLimiterOptions{
+		Max:            max,
+		Window:         window,
+		TrustedProxies: o.trustedProxies,
+		OnStoreError:   o.onStoreError,
+	})
+	clientIPs := utils.MustClientIPResolver(o.trustedProxies)
 	instance := &arcisInstance{rateLimiter: limiter}
 	registerInstance(instance)
 
@@ -934,7 +989,7 @@ func RateLimitWithSkip(max int, window time.Duration, skip func(echo.Context) bo
 			if o.telemetry != nil {
 				defer func() {
 					if didDeny {
-						emitRateLimitDeny(o.telemetry, c, start)
+						emitRateLimitDeny(o.telemetry, c, clientIPs, start)
 					}
 				}()
 			}
